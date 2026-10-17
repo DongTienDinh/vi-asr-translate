@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 from pathlib import Path
 from typing import Optional, Tuple, Union
@@ -37,6 +38,34 @@ class GlobalCMVN(nn.Module):
         return x
 
     @classmethod
+    def from_json_file(cls, cmvn_file: Union[str, Path], norm_var: bool = True) -> GlobalCMVN:
+        """Load CMVN statistics from JSON format file (as used by ChunkFormer/ViP-VL)."""
+        p = Path(cmvn_file)
+        if not p.exists():
+            raise FileNotFoundError(f"CMVN file not found: {p}")
+
+        with open(p, "r", encoding="utf-8") as f:
+            cmvn_stats = json.load(f)
+
+        means = cmvn_stats["mean_stat"]
+        variance = cmvn_stats["var_stat"]
+        count = float(cmvn_stats["frame_num"])
+
+        feat_dim = len(means)
+        means_arr = np.zeros(feat_dim, dtype=np.float32)
+        istd_arr = np.zeros(feat_dim, dtype=np.float32)
+
+        for i in range(feat_dim):
+            m = means[i] / count
+            v = variance[i] / count - m * m
+            if v < 1.0e-20:
+                v = 1.0e-20
+            means_arr[i] = m
+            istd_arr[i] = 1.0 / math.sqrt(v)
+
+        return cls(torch.from_numpy(means_arr), torch.from_numpy(istd_arr), norm_var=norm_var)
+
+    @classmethod
     def from_kaldi_file(cls, cmvn_file: Union[str, Path], norm_var: bool = True) -> GlobalCMVN:
         """Load CMVN statistics from Kaldi text file."""
         p = Path(cmvn_file)
@@ -63,6 +92,13 @@ class GlobalCMVN(nn.Module):
             istd_arr[i] = 1.0 / math.sqrt(v)
 
         return cls(torch.from_numpy(means_arr), torch.from_numpy(istd_arr), norm_var=norm_var)
+
+    @classmethod
+    def from_file(cls, cmvn_file: Union[str, Path], is_json: bool = True, norm_var: bool = True) -> GlobalCMVN:
+        """Load CMVN statistics from either json or kaldi format."""
+        if is_json:
+            return cls.from_json_file(cmvn_file, norm_var=norm_var)
+        return cls.from_kaldi_file(cmvn_file, norm_var=norm_var)
 
 
 class KaldiFrontend(nn.Module):

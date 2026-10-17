@@ -22,7 +22,7 @@
 | **Step 3** | Audio Frontend & Kaldi Parity (`povey`, 80 mel, scale $32768$, CMVN once, SpecAugment) | **COMPLETED** | **Gate G2 (Frontend) Passed**: Kaldi parity diff < 1e-5, scale 32768 confirmed, SpecAugment & GlobalCMVN verified. |
 | **Step 4** | Data Adapter for HF `ViMD_Dataset`, Manifests, SentencePiece BPE Tokenizer | **COMPLETED** | **Gate G1 (Data & Tokenizer) Passed**: Manifest schema, train-only BPE, CTC collapse, inequality $T_{\text{out}} \ge U + R$, audit leakage suite verified. |
 | **Step 5** | PhoBERT Offline Token Cache Generator (VnCoreNLP wseg, sliding windows > 256) | **COMPLETED** | **Gate G1 (Cache) Passed**: Sliding-window non-truncating stitching, `[N, 768]` float16 sharded npy + zero-copy `TeacherCacheReader`, KeyError on missing sample. |
-| **Step 6** | ViP-VL Encoder Wrapper (clean CTC without upstream decoder) & Checkpoint Loader | *Pending* | Gate G2: Zero missing/unexpected backbone keys, `load_report.json`. |
+| **Step 6** | ViP-VL Encoder Wrapper (clean CTC without upstream decoder) & Checkpoint Loader | **COMPLETED** | **Gate G2 (Encoder & CTC) Passed**: Pure CTC without upstream decoder, zero missing/unexpected backbone keys, FP32 target-normalized CTC loss, `load_report.json` verified. |
 | **Step 7** | Token–Frame Pooling & Gaussian Temporal Prior Module, Loss Functions | *Pending* | Gate G3: Mask invariance, Attention rows sum=1, teacher zero-grad. |
 | **Step 8** | Gate G4 Tiny Overfit Suite (16–32 samples for B1, P1, P2) | *Pending* | Gate G4: Verified learning convergence on toy dataset. |
 | **Step 9** | DDP Engine (Global Duration Sampler, Loss Normalization $\frac{R \cdot D}{W}$, Distributed Eval) | *Pending* | Gates G5, G6, G7: Gradient equivalence test, atomic resume. |
