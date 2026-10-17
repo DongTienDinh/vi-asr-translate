@@ -19,7 +19,7 @@
 |---|---|---|---|
 | **Step 1** | Project setup, `pyproject.toml`, CLI skeleton, YAML config hierarchy, `AGENTS.md` | **COMPLETED** | **Gate G0 Passed**: CLI routing, typed config validation, schema inheritance. |
 | **Step 2** | Clone & Vendor `chunkformer`, Source Audit, Activation Checkpointing Patch | **COMPLETED** | **Gate G0/G2 Passed**: SHA `24b12583...` pinned, non-reentrant checkpoint patch verified (diff < 1e-5), lazy import fixed, audit doc created. |
-| **Step 3** | Audio Frontend & Kaldi Parity (`povey`, 80 mel, scale $32768$, CMVN once, SpecAugment) | *Pending* | Gate G2: Absolute numerical difference $< 10^{-5}$ vs Kaldi. |
+| **Step 3** | Audio Frontend & Kaldi Parity (`povey`, 80 mel, scale $32768$, CMVN once, SpecAugment) | **COMPLETED** | **Gate G2 (Frontend) Passed**: Kaldi parity diff < 1e-5, scale 32768 confirmed, SpecAugment & GlobalCMVN verified. |
 | **Step 4** | Data Adapter for HF `ViMD_Dataset`, Manifests, SentencePiece BPE Tokenizer | *Pending* | Gate G1: CTC validity $T_{\text{out}} \ge U + R$, audit leakage. |
 | **Step 5** | PhoBERT Offline Token Cache Generator (VnCoreNLP wseg, sliding windows > 256) | *Pending* | Gate G1: Sharded npy/memmap `[N, 768]`, 100% train coverage. |
 | **Step 6** | ViP-VL Encoder Wrapper (clean CTC without upstream decoder) & Checkpoint Loader | *Pending* | Gate G2: Zero missing/unexpected backbone keys, `load_report.json`. |
