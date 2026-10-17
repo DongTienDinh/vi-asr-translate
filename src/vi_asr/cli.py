@@ -62,19 +62,99 @@ def cmd_audit(args: argparse.Namespace) -> int:
     config_hash = dump_resolved_config(cfg, report_dir / "resolved_config.yaml")
     logger.info("Resolved config SHA256: %s", config_hash)
     logger.info("Saved resolved configuration to %s", report_dir / "resolved_config.yaml")
-    logger.info("Audit gate G0 passed. Data manifest checks will execute when data is present.")
+
+    # Run data manifest audit if data manifests exist
+    data_root = Path(cfg["paths"]["data_root"])
+    train_manifest = data_root / "train.jsonl"
+    if not train_manifest.exists():
+        train_manifest = data_root / "manifests" / "train.jsonl"
+
+    if train_manifest.exists():
+        from vi_asr.data.audit import audit_splits
+        valid_manifest = data_root / "valid.jsonl"
+        if not valid_manifest.exists():
+            valid_manifest = data_root / "manifests" / "valid.jsonl"
+        test_manifest = data_root / "test.jsonl"
+        if not test_manifest.exists():
+            test_manifest = data_root / "manifests" / "test.jsonl"
+
+        logger.info("Found manifests in %s. Running full audit and leakage checks...", data_root)
+        audit_summary = audit_splits(
+            train_manifest=train_manifest,
+            valid_manifest=valid_manifest if valid_manifest.exists() else None,
+            test_manifest=test_manifest if test_manifest.exists() else None,
+            report_dir=report_dir,
+        )
+        logger.info("Audit completed. Total train samples: %d", audit_summary["splits"]["train"]["total_samples"])
+    else:
+        logger.info("Audit gate G0 passed. Data manifests not yet materialized in %s.", data_root)
+
     return 0
 
 
 def cmd_prepare_data(args: argparse.Namespace) -> int:
     """Download/Stream ViMD and prepare canonical manifests and audio."""
-    logger.info("Subcommand 'prepare-data' invoked (belongs to Step 4).")
+    logger.info("Running prepare-data...")
+    cfg = resolve_config(
+        base_path=args.config,
+        variant_path=args.variant,
+        profile_path=args.profile,
+        paths_path=args.paths,
+        overrides=args.override,
+    )
+    data_root = Path(cfg["paths"]["data_root"])
+    data_root.mkdir(parents=True, exist_ok=True)
+    logger.info("Target data root: %s", data_root)
+    logger.info("In Kaggle environment, add Hugging Face dataset nguyendv02/ViMD_Dataset or run prepare_manifests_from_hf.")
     return 0
 
 
 def cmd_build_tokenizer(args: argparse.Namespace) -> int:
     """Build SentencePiece BPE tokenizer exclusively from train split."""
-    logger.info("Subcommand 'build-tokenizer' invoked (belongs to Step 4).")
+    from vi_asr.data.manifest import load_manifest
+    from vi_asr.data.tokenizer import Tokenizer, train_bpe_tokenizer
+
+    logger.info("Building SentencePiece BPE tokenizer exclusively from train split...")
+    cfg = resolve_config(
+        base_path=args.config,
+        variant_path=args.variant,
+        profile_path=args.profile,
+        paths_path=args.paths,
+        overrides=args.override,
+    )
+    data_root = Path(cfg["paths"]["data_root"])
+    train_manifest = data_root / "train.jsonl"
+    if not train_manifest.exists():
+        train_manifest = data_root / "manifests" / "train.jsonl"
+
+    if not train_manifest.exists():
+        logger.error("Train manifest not found at %s. Please run prepare-data first.", train_manifest)
+        return 1
+
+    items = load_manifest(train_manifest)
+    transcripts = [it.text_asr for it in items]
+
+    tok_cfg = cfg.get("tokenizer", {})
+    vocab_size = int(tok_cfg.get("vocab_size_target", 1024))
+    char_cov = float(tok_cfg.get("character_coverage", 1.0))
+    pad_id = int(tok_cfg.get("pad_id", 0))
+    unk_id = int(tok_cfg.get("unk_id", 1))
+
+    out_dir = Path(cfg["paths"]["project_root"]) / "artifacts" / "tokenizer"
+    model_prefix = out_dir / f"bpe_{vocab_size}"
+
+    model_path = train_bpe_tokenizer(
+        transcripts=transcripts,
+        model_prefix=model_prefix,
+        vocab_size=vocab_size,
+        character_coverage=char_cov,
+        pad_id=pad_id,
+        unk_id=unk_id,
+    )
+    logger.info("Trained tokenizer model saved to %s", model_path)
+
+    tok = Tokenizer(model_path)
+    logger.info("Verified tokenizer: vocab_size=%d, blank_id=%d, unk_id=%d", tok.vocab_size, tok.blank_id, tok.unk_id)
     return 0
 
 
