@@ -1,0 +1,12 @@
+experiment:
+  name: b1_ctc
+
+alignment:
+  enabled: false
+
+dialect:
+  enabled: false
+
+loss:
+  lambda_token: 0.0
+  lambda_region: 0.0

@@ -1,0 +1,23 @@
+runtime:
+  device: cpu
+  expected_world_size: 1
+  distributed_backend: gloo
+  precision: fp32
+  grad_scaler: false
+  num_workers_per_rank: 0
+  pin_memory: false
+  persistent_workers: false
+  prefetch_factor: null
+  ddp_find_unused_parameters: false
+  ddp_gradient_as_bucket_view: false
+  ddp_static_graph: false
+  process_group_timeout_minutes: 10
+
+batching:
+  max_samples_per_rank: 2
+  max_padded_fbank_frames_per_rank: 1600
+  accumulation_steps: 1
+  duration_bucketing: false
+  training_tail_policy: drop_incomplete_rank_group_logged
+  accumulation_normalization: global_sample_count
+  validation_shard: no_padding_no_drop

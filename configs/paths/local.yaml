@@ -1,0 +1,6 @@
+paths:
+  project_root: .
+  data_root: artifacts/prepared
+  teacher_root: artifacts/teacher_cache
+  models_root: artifacts/models
+  output_root: runs

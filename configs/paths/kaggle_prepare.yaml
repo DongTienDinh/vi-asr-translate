@@ -1,0 +1,6 @@
+paths:
+  project_root: /kaggle/working/vi_asr_project
+  data_root: /kaggle/working/artifacts/prepared
+  teacher_root: /kaggle/working/artifacts/teacher_cache
+  models_root: /kaggle/working/artifacts/models
+  output_root: /kaggle/working/runs

@@ -1,0 +1,12 @@
+experiment:
+  name: d1_dialect_only
+
+alignment:
+  enabled: false
+
+dialect:
+  enabled: true
+
+loss:
+  lambda_token: 0.0
+  lambda_region: 0.1

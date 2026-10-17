@@ -1,0 +1,15 @@
+# Top-level dependencies for Kaggle environment
+# Torch and Torchaudio are pre-installed in Kaggle CUDA images, do not force-reinstall them
+pyyaml>=6.0
+numpy>=1.23.0
+scipy>=1.9.0
+soundfile>=0.12.0
+tqdm>=4.65.0
+huggingface-hub>=0.20.0
+datasets>=2.16.0
+sentencepiece>=0.1.99
+transformers>=4.36.0
+jiwer>=3.0.0
+sacrebleu>=2.3.0
+py-vncorenlp>=0.1.4
+gradio>=4.0.0

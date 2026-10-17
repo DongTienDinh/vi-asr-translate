@@ -1,0 +1,100 @@
+From: vi_asr team
+Subject: [PATCH] feat(encoder): add non-reentrant activation checkpointing and lazy model import
+
+1. Enable torch.utils.checkpoint.checkpoint with use_reentrant=False in
+   ChunkFormerEncoder.forward_layers to reduce activation memory on dual T4.
+2. Bind layer per-iteration via closure helper make_custom_forward.
+3. Lazy-load ChunkFormerModel in chunkformer/__init__.py to prevent eager top-level dependency errors.
+---
+ chunkformer/__init__.py        |  7 +++++-
+ chunkformer/modules/encoder.py | 42 ++++++++++++++++++++++++++++++----
+ 2 files changed, 44 insertions(+), 5 deletions(-)
+
+diff --git a/chunkformer/__init__.py b/chunkformer/__init__.py
+index 9fda618..55f4ebc 100644
+--- a/chunkformer/__init__.py
++++ b/chunkformer/__init__.py
+@@ -9,6 +9,11 @@ __version__ = "1.2.2"
+ __author__ = "khanld"
+ __email__ = "khanhld218@gmail.com"
+ 
+-from chunkformer.chunkformer_model import ChunkFormerModel
++def __getattr__(name: str):
++    if name == "ChunkFormerModel":
++        from chunkformer.chunkformer_model import ChunkFormerModel
++        return ChunkFormerModel
++    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
++
+ 
+ __all__ = ["ChunkFormerModel", "__version__"]
+diff --git a/chunkformer/modules/encoder.py b/chunkformer/modules/encoder.py
+index 26887ef..ee92d4f 100644
+--- a/chunkformer/modules/encoder.py
++++ b/chunkformer/modules/encoder.py
+@@ -19,6 +19,7 @@ import random
+ from typing import List, Optional, Tuple
+ 
+ import torch
++import torch.utils.checkpoint
+ 
+ from chunkformer.modules.attention import ChunkAttentionWithRelativeRightContext
+ from chunkformer.modules.convolution import ChunkConvolutionModule
+@@ -306,17 +307,47 @@ class ChunkFormerEncoder(torch.nn.Module):
+                     r_att_cache.append(new_att_cache)
+                     r_cnn_cache.append(new_cnn_cache)
+                     continue
+-            xs, _, new_att_cache, new_cnn_cache = layer(
+-                xs,
+-                masks,
+-                pos_emb,
+-                mask_pad,
+-                att_cache=att_cache[idx] if att_cache.size(0) > 0 else empty_att_cache,
+-                cnn_cache=cnn_cache[idx] if cnn_cache.size(0) > 0 else empty_cnn_cache,
+-                chunk_size=chunk_size,
+-                left_context_size=left_context_size,
+-                right_context_size=right_context_size,
+-            )
++            cur_att_cache = att_cache[idx] if att_cache.size(0) > 0 else empty_att_cache
++            cur_cnn_cache = cnn_cache[idx] if cnn_cache.size(0) > 0 else empty_cnn_cache
++
++            if self.gradient_checkpointing and self.training and xs.requires_grad:
++                def make_custom_forward(mod):
++                    def custom_forward(x_in, m_in, p_in, mp_in, a_in, c_in):
++                        return mod(
++                            x_in,
++                            m_in,
++                            p_in,
++                            mp_in,
++                            att_cache=a_in,
++                            cnn_cache=c_in,
++                            chunk_size=chunk_size,
++                            left_context_size=left_context_size,
++                            right_context_size=right_context_size,
++                        )
++                    return custom_forward
++
++                xs, _, new_att_cache, new_cnn_cache = torch.utils.checkpoint.checkpoint(
++                    make_custom_forward(layer),
++                    xs,
++                    masks,
++                    pos_emb,
++                    mask_pad,
++                    cur_att_cache,
++                    cur_cnn_cache,
++                    use_reentrant=False,
++                )
++            else:
++                xs, _, new_att_cache, new_cnn_cache = layer(
++                    xs,
++                    masks,
++                    pos_emb,
++                    mask_pad,
++                    att_cache=cur_att_cache,
++                    cnn_cache=cur_cnn_cache,
++                    chunk_size=chunk_size,
++                    left_context_size=left_context_size,
++                    right_context_size=right_context_size,
++                )
+             # During training/SSL the caches are empty; force empty placeholders
+             # so torch.stack works even when some layers are dropped.
+             if att_cache.size(0) == 0:

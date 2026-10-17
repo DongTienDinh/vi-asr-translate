@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vi-asr"
+version = "0.1.0"
+description = "Vietnamese ASR to English Translation with Token-Frame Pooling on Kaggle T4x2"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+    { name = "Vietnamese ASR Research Team" }
+]
+keywords = ["speech-recognition", "vietnamese-asr", "translation", "ctc", "chunkformer", "phobert"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+    "pyyaml>=6.0",
+    "numpy>=1.23.0",
+    "scipy>=1.9.0",
+    "soundfile>=0.12.0",
+    "tqdm>=4.65.0",
+    "huggingface-hub>=0.20.0",
+    "sentencepiece>=0.1.99",
+    "jiwer>=3.0.0",
+    "sacrebleu>=2.3.0",
+]
+
+[project.optional-dependencies]
+torch = [
+    "torch>=2.1.0",
+    "torchaudio>=2.1.0",
+]
+nlp = [
+    "transformers>=4.36.0",
+    "datasets>=2.16.0",
+    "py-vncorenlp>=0.1.4",
+]
+demo = [
+    "gradio>=4.0.0",
+]
+dev = [
+    "pytest>=7.0.0",
+]
+
+[project.scripts]
+vi-asr = "vi_asr.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["vi_asr*"]

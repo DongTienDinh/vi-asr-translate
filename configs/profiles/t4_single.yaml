@@ -1,0 +1,24 @@
+runtime:
+  device: cuda
+  expected_world_size: 1
+  distributed_backend: nccl
+  precision: fp16_amp
+  grad_scaler: true
+  num_workers_per_rank: 2
+  dataloader_start_method: spawn
+  pin_memory: true
+  persistent_workers: false
+  prefetch_factor: 2
+  ddp_find_unused_parameters: false
+  ddp_gradient_as_bucket_view: true
+  ddp_static_graph: false
+  process_group_timeout_minutes: 30
+
+batching:
+  max_samples_per_rank: 2
+  max_padded_fbank_frames_per_rank: 6400
+  accumulation_steps: 16
+  duration_bucketing: true
+  training_tail_policy: drop_incomplete_rank_group_logged
+  accumulation_normalization: global_sample_count
+  validation_shard: no_padding_no_drop

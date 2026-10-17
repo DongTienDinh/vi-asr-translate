@@ -1,0 +1,17 @@
+asr:
+  metrics: [wer, cer]
+  subword_level: true
+  syllable_level: true
+  regions: [North, Central, South]
+  report_substitutions_deletions_insertions: true
+
+mt:
+  metrics: [bleu, chrf]
+  sacrebleu_tokenize: 13a
+  chrf_word_order: 2
+
+bootstrap:
+  enabled: true
+  num_resamples: 1000
+  confidence_level: 0.95
+  seed: 42

@@ -1,0 +1,14 @@
+experiment:
+  name: p2_token_temporal
+
+alignment:
+  enabled: true
+  temporal:
+    enabled: true
+
+dialect:
+  enabled: false
+
+loss:
+  lambda_token: 0.1
+  lambda_region: 0.0
