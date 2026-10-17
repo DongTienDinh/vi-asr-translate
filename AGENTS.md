@@ -21,7 +21,7 @@
 | **Step 2** | Clone & Vendor `chunkformer`, Source Audit, Activation Checkpointing Patch | **COMPLETED** | **Gate G0/G2 Passed**: SHA `24b12583...` pinned, non-reentrant checkpoint patch verified (diff < 1e-5), lazy import fixed, audit doc created. |
 | **Step 3** | Audio Frontend & Kaldi Parity (`povey`, 80 mel, scale $32768$, CMVN once, SpecAugment) | **COMPLETED** | **Gate G2 (Frontend) Passed**: Kaldi parity diff < 1e-5, scale 32768 confirmed, SpecAugment & GlobalCMVN verified. |
 | **Step 4** | Data Adapter for HF `ViMD_Dataset`, Manifests, SentencePiece BPE Tokenizer | **COMPLETED** | **Gate G1 (Data & Tokenizer) Passed**: Manifest schema, train-only BPE, CTC collapse, inequality $T_{\text{out}} \ge U + R$, audit leakage suite verified. |
-| **Step 5** | PhoBERT Offline Token Cache Generator (VnCoreNLP wseg, sliding windows > 256) | *Pending* | Gate G1: Sharded npy/memmap `[N, 768]`, 100% train coverage. |
+| **Step 5** | PhoBERT Offline Token Cache Generator (VnCoreNLP wseg, sliding windows > 256) | **COMPLETED** | **Gate G1 (Cache) Passed**: Sliding-window non-truncating stitching, `[N, 768]` float16 sharded npy + zero-copy `TeacherCacheReader`, KeyError on missing sample. |
 | **Step 6** | ViP-VL Encoder Wrapper (clean CTC without upstream decoder) & Checkpoint Loader | *Pending* | Gate G2: Zero missing/unexpected backbone keys, `load_report.json`. |
 | **Step 7** | Token–Frame Pooling & Gaussian Temporal Prior Module, Loss Functions | *Pending* | Gate G3: Mask invariance, Attention rows sum=1, teacher zero-grad. |
 | **Step 8** | Gate G4 Tiny Overfit Suite (16–32 samples for B1, P1, P2) | *Pending* | Gate G4: Verified learning convergence on toy dataset. |

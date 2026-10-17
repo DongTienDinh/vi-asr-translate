@@ -160,7 +160,39 @@ def cmd_build_tokenizer(args: argparse.Namespace) -> int:
 
 def cmd_cache_teacher(args: argparse.Namespace) -> int:
     """Extract and cache frozen PhoBERT token representations."""
-    logger.info("Subcommand 'cache-teacher' invoked (belongs to Step 5).")
+    from vi_asr.data.manifest import load_manifest
+    from vi_asr.data.teacher_cache import PhoBERTTeacherExtractor, build_offline_teacher_cache
+
+    logger.info("Extracting and caching frozen PhoBERT token representations...")
+    cfg = resolve_config(
+        base_path=args.config,
+        variant_path=args.variant,
+        profile_path=args.profile,
+        paths_path=args.paths,
+        overrides=args.override,
+    )
+    data_root = Path(cfg["paths"]["data_root"])
+    split_name = getattr(args, "split", "train")
+    manifest_file = data_root / f"{split_name}.jsonl"
+    if not manifest_file.exists():
+        manifest_file = data_root / "manifests" / f"{split_name}.jsonl"
+
+    if not manifest_file.exists():
+        logger.error("Manifest %s not found. Please run prepare-data first.", manifest_file)
+        return 1
+
+    items = load_manifest(manifest_file)
+    logger.info("Loaded %d manifest items for split '%s'", len(items), split_name)
+
+    t_cfg = cfg.get("teacher", {})
+    model_id = t_cfg.get("id", "vinai/phobert-base")
+    revision = t_cfg.get("revision", "01daacda68afe13d83023d16ec647239e344a1e6")
+    device = getattr(args, "device", "cpu")
+
+    extractor = PhoBERTTeacherExtractor(model_id=model_id, revision=revision, device=device)
+    cache_dir = Path(cfg["paths"]["teacher_root"])
+    build_offline_teacher_cache(items, cache_dir, extractor)
+    logger.info("Teacher cache generation complete: saved to %s", cache_dir)
     return 0
 
 
