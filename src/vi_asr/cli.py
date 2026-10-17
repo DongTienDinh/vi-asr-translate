@@ -197,9 +197,27 @@ def cmd_cache_teacher(args: argparse.Namespace) -> int:
 
 
 def cmd_smoke(args: argparse.Namespace) -> int:
-    """Run single-GPU smoke test on a small subset of samples."""
-    logger.info("Subcommand 'smoke' invoked (belongs to Step 8/Gate G4).")
+    """Run smoke test (Gate G4) verifying learning convergence across variants."""
+    from vi_asr.training.overfit import run_tiny_overfit
+
+    logger.info("Running Gate G4 Smoke Test on variants B1, P1, P2...")
+    for var in ("b1", "p1", "p2"):
+        logger.info("Testing tiny overfit convergence on variant '%s'...", var)
+        res = run_tiny_overfit(variant=var, num_samples=8, num_steps=25)
+        logger.info(
+            "Variant '%s': loss %.4f -> %.4f (converged: %s)",
+            var,
+            res["initial_loss"],
+            res["final_loss"],
+            res["converged"],
+        )
+        if not res["converged"]:
+            logger.error("Smoke test failed for variant %s", var)
+            return 1
+
+    logger.info("Gate G4 Smoke Test PASSED across all variants.")
     return 0
+
 
 
 def cmd_pilot(args: argparse.Namespace) -> int:

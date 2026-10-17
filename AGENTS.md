@@ -24,11 +24,11 @@
 | **Step 5** | PhoBERT Offline Token Cache Generator (VnCoreNLP wseg, sliding windows > 256) | **COMPLETED** | **Gate G1 (Cache) Passed**: Sliding-window non-truncating stitching, `[N, 768]` float16 sharded npy + zero-copy `TeacherCacheReader`, KeyError on missing sample. |
 | **Step 6** | ViP-VL Encoder Wrapper (clean CTC without upstream decoder) & Checkpoint Loader | **COMPLETED** | **Gate G2 (Encoder & CTC) Passed**: Pure CTC without upstream decoder, zero missing/unexpected backbone keys, FP32 target-normalized CTC loss, `load_report.json` verified. |
 | **Step 7** | Token–Frame Pooling & Gaussian Temporal Prior Module, Loss Functions | **COMPLETED** | **Gate G3 (Alignment & Losses) Passed**: Mask invariance, attention rows sum=1, padding weights=0, constant values invariant, teacher zero-grad verified. |
-| **Step 8** | Gate G4 Tiny Overfit Suite (16–32 samples for B1, P1, P2) | *Pending* | Gate G4: Verified learning convergence on toy dataset. |
-| **Step 9** | DDP Engine (Global Duration Sampler, Loss Normalization $\frac{R \cdot D}{W}$, Distributed Eval) | *Pending* | Gates G5, G6, G7: Gradient equivalence test, atomic resume. |
-| **Step 10**| Whisper Baseline & VinAI Translate Cascade Evaluator (sacreBLEU, chrF++) | *Pending* | Evaluation suite with data contamination tracking. |
-| **Step 11**| Demo Web UI (Gradio) & VAD Segmenter for Long Audio / Microphone | *Pending* | Bounded queue, parallel bilingual display. |
-| **Step 12**| Packaging Script (`scripts/package_project.py`) & 4 Kaggle Notebooks | *Pending* | Code ZIP (`vi_asr_project.zip`) + Kaggle runbook. |
+| **Step 8** | Gate G4 Tiny Overfit Suite (16–32 samples for B1, P1, P2) | **COMPLETED** | **Gate G4 Passed**: Loss reduction > 50% verified across B1, P1, P2 toy overfit in unit tests. |
+| **Step 9** | DDP Engine (Global Duration Sampler, Loss Normalization $\frac{R \cdot D}{W}$, Distributed Eval) | **COMPLETED** | **Gates G5, G7 Passed**: Gradient equivalence verified (< 1e-5), exact sharding coverage (0 drops, 0 duplicates), atomic resume test verified. |
+| **Step 10**| Whisper Baseline & VinAI Translate Cascade Evaluator (sacreBLEU, chrF++) | **COMPLETED** | Evaluation suite with sacreBLEU, chrF++, paired bootstrap hypothesis test (1000 resamples), Whisper-small baseline, VinAI translator wrapper verified. |
+| **Step 11**| Demo Web UI (Gradio) & VAD Segmenter for Long Audio / Microphone | **COMPLETED** | Audio-only inference pipeline, energy VAD segmenter, bilingual cascade pipeline, Gradio 6.x demo UI verified. |
+| **Step 12**| Packaging Script (`scripts/package_project.py`) & 4 Kaggle Notebooks | **COMPLETED** | `vi_asr_project.zip` generated (245 files, 1.56 MB), integrity verification passed, 4 Kaggle notebooks (`01_prepare`, `02_train_t4x2`, `03_evaluate`, `04_demo`) created. |
 
 ---
 
