@@ -10,7 +10,7 @@
 | **G0** | Source audit, schema YAML, import CLI, vendor patch | **PASSED** | CLI routes successfully, base/variant/profile configs valid, chunkformer audited & non-reentrant checkpoint patch verified |
 | **G1** | Data integrity, split audit, tokenizer, token cache | **PASSED** | Manifest schema, train-only BPE, CTC collapse & inequality, sliding-window token cache & TeacherCacheReader verified |
 | **G2** | Encoder loading, frontend parity, CTC shapes | **PASSED** | Frontend Kaldi parity passed (diff < 1e-5), pure CTC encoder adapter, zero missing/unexpected backbone keys, FP32 CTC loss verified |
-| **G3** | Masking, alignment loss, no-grad teacher check | `not_run` | Awaiting Step 7 |
+| **G3** | Masking, alignment loss, no-grad teacher check | **PASSED** | Mask invariance, attention rows sum=1, padding weights=0, constant values invariant, teacher zero-grad verified |
 | **G4** | Tiny overfit on 16–32 samples (B1, P1, P2) | `not_run` | Awaiting Step 8 |
 | **G5** | DDP Sampler & gradient equivalence test | `not_run` | Awaiting Step 9 |
 | **G6** | 2× T4 Pilot 100 updates, memory, resume check | `not_run` | Awaiting Kaggle run |
