@@ -1,0 +1,4 @@
+[submodule "third_party/chunkformer"]
+	path = third_party/chunkformer
+	url = https://github.com/khanld/chunkformer.git
+	ignore = dirty
