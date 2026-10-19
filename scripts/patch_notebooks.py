@@ -9,6 +9,7 @@ ENV_CELL_SNIPPET = [
     "%env HF_DATASETS_CACHE=/tmp/huggingface/datasets\n",
     "%env TRANSFORMERS_CACHE=/tmp/huggingface/hub\n",
     "%env TORCH_HOME=/tmp/torch\n",
+    "%env PYTHONPATH=/kaggle/working/vi_asr_project/src\n",
 ]
 
 def patch_01():
@@ -20,7 +21,7 @@ def patch_01():
         "# 2. Nạp mã nguồn vi_asr_project (từ Zip hoặc Git Clone trực tiếp)\n",
         "%cd /kaggle/working\n",
         *ENV_CELL_SNIPPET,
-        "import os, zipfile\n",
+        "import os, sys, zipfile\n",
         "from pathlib import Path\n",
         "\n",
         "work_dir = Path(\"/kaggle/working/vi_asr_project\")\n",
@@ -37,11 +38,16 @@ def patch_01():
         "    !rm -rf /kaggle/working/vi_asr_project\n",
         "    !git clone --recurse-submodules https://github.com/DongTienDinh/vi-asr-translate.git /kaggle/working/vi_asr_project\n",
         "\n",
+        "# Thêm thư mục src vào sys.path của Kernel hiện tại\n",
+        "src_dir = str(work_dir / \"src\")\n",
+        "if src_dir not in sys.path:\n",
+        "    sys.path.insert(0, src_dir)\n",
+        "\n",
         "# Cài đặt package vi-asr ở chế độ editable\n",
         "%cd /kaggle/working/vi_asr_project\n",
         "!pip install -q -e .\n",
         "import vi_asr\n",
-        "print('vi_asr successfully installed from:', vi_asr.__file__)\n"
+        "print('vi_asr successfully installed and loaded from:', vi_asr.__file__)\n"
     ]
     nb["cells"][3]["source"] = [
         "# 3. Chuẩn bị manifests dữ liệu từ Hugging Face\n",
@@ -83,6 +89,7 @@ def patch_02():
         "# 2. Chuyển vào thư mục dự án và kiểm tra CLI\n",
         "%cd /kaggle/working\n",
         *ENV_CELL_SNIPPET,
+        "import sys\n",
         "from pathlib import Path\n",
         "\n",
         "work_dir = Path(\"/kaggle/working/vi_asr_project\")\n",
@@ -93,6 +100,10 @@ def patch_02():
         "    !pip install -q -e .\n",
         "else:\n",
         "    %cd /kaggle/working/vi_asr_project\n",
+        "\n",
+        "src_dir = str(work_dir / \"src\")\n",
+        "if src_dir not in sys.path:\n",
+        "    sys.path.insert(0, src_dir)\n",
         "\n",
         "!python -m vi_asr --help\n"
     ]
@@ -109,6 +120,7 @@ def patch_03():
         "# Kiểm tra mã nguồn dự án và thiết bị\n",
         "%cd /kaggle/working\n",
         *ENV_CELL_SNIPPET,
+        "import sys\n",
         "from pathlib import Path\n",
         "import torch\n",
         "\n",
@@ -120,6 +132,10 @@ def patch_03():
         "    !pip install -q -e .\n",
         "else:\n",
         "    %cd /kaggle/working/vi_asr_project\n",
+        "\n",
+        "src_dir = str(work_dir / \"src\")\n",
+        "if src_dir not in sys.path:\n",
+        "    sys.path.insert(0, src_dir)\n",
         "\n",
         "print(\"Ready for evaluation on device:\", torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"CPU\")\n"
     ]
@@ -136,6 +152,7 @@ def patch_04():
         "# Chuẩn bị mã nguồn dự án và cài đặt dependencies cho Web UI\n",
         "%cd /kaggle/working\n",
         *ENV_CELL_SNIPPET,
+        "import sys\n",
         "from pathlib import Path\n",
         "\n",
         "work_dir = Path(\"/kaggle/working/vi_asr_project\")\n",
@@ -145,7 +162,10 @@ def patch_04():
         "\n",
         "%cd /kaggle/working/vi_asr_project\n",
         "!pip install -q -e .\n",
-        "!pip install -q gradio soundfile\n"
+        "!pip install -q gradio soundfile\n",
+        "src_dir = str(work_dir / \"src\")\n",
+        "if src_dir not in sys.path:\n",
+        "    sys.path.insert(0, src_dir)\n"
     ]
     with open(p, "w", encoding="utf-8") as f:
         json.dump(nb, f, indent=1, ensure_ascii=False)
