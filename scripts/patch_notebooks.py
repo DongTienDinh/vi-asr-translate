@@ -1,7 +1,15 @@
-"""Update notebook cells to safely cd to /kaggle/working before clone."""
+"""Update notebook cells to safely cd to /kaggle/working and set writable HF cache dirs."""
 
 import json
 from pathlib import Path
+
+ENV_CELL_SNIPPET = [
+    "# Cấu hình thư mục cache Hugging Face ghi vào /tmp để không bị lỗi Read-only /root/.cache\n",
+    "%env HF_HOME=/tmp/huggingface\n",
+    "%env HF_DATASETS_CACHE=/tmp/huggingface/datasets\n",
+    "%env TRANSFORMERS_CACHE=/tmp/huggingface/hub\n",
+    "%env TORCH_HOME=/tmp/torch\n",
+]
 
 def patch_01():
     p = Path("notebooks/01_prepare.ipynb")
@@ -11,6 +19,7 @@ def patch_01():
     nb["cells"][2]["source"] = [
         "# 2. Nạp mã nguồn vi_asr_project (từ Zip hoặc Git Clone trực tiếp)\n",
         "%cd /kaggle/working\n",
+        *ENV_CELL_SNIPPET,
         "import os, zipfile\n",
         "from pathlib import Path\n",
         "\n",
@@ -73,6 +82,7 @@ def patch_02():
     nb["cells"][2]["source"] = [
         "# 2. Chuyển vào thư mục dự án và kiểm tra CLI\n",
         "%cd /kaggle/working\n",
+        *ENV_CELL_SNIPPET,
         "from pathlib import Path\n",
         "\n",
         "work_dir = Path(\"/kaggle/working/vi_asr_project\")\n",
@@ -98,6 +108,7 @@ def patch_03():
     nb["cells"][1]["source"] = [
         "# Kiểm tra mã nguồn dự án và thiết bị\n",
         "%cd /kaggle/working\n",
+        *ENV_CELL_SNIPPET,
         "from pathlib import Path\n",
         "import torch\n",
         "\n",
@@ -124,6 +135,7 @@ def patch_04():
     nb["cells"][1]["source"] = [
         "# Chuẩn bị mã nguồn dự án và cài đặt dependencies cho Web UI\n",
         "%cd /kaggle/working\n",
+        *ENV_CELL_SNIPPET,
         "from pathlib import Path\n",
         "\n",
         "work_dir = Path(\"/kaggle/working/vi_asr_project\")\n",

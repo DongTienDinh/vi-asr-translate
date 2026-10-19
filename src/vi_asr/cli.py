@@ -155,7 +155,10 @@ def cmd_prepare_data(args: argparse.Namespace) -> int:
     try:
         from datasets import load_dataset
 
-        ds = load_dataset(hf_id, revision=revision)
+        cache_dir = os.environ.get("HF_DATASETS_CACHE") or ("/tmp/huggingface/datasets" if Path("/kaggle").exists() else None)
+        if cache_dir:
+            Path(cache_dir).mkdir(parents=True, exist_ok=True)
+        ds = load_dataset(hf_id, revision=revision, cache_dir=cache_dir)
         manifest_paths = prepare_manifests_from_hf(ds, output_dir=data_root, source_revision=revision)
         logger.info("Successfully prepared manifests: %s", manifest_paths)
         return 0
