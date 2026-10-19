@@ -35,7 +35,9 @@ class PhoBERTTeacherExtractor:
     ):
         from transformers import AutoModel, AutoTokenizer
         self.model_id = model_id
-        self.revision = revision
+        if "cuda" in str(device) and not torch.cuda.is_available():
+            logger.warning("CUDA requested for PhoBERT teacher but not available. Falling back to CPU.")
+            device = "cpu"
         self.device = torch.device(device)
         self.max_content_window = max_content_window
 

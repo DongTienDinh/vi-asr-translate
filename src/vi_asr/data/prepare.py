@@ -21,6 +21,7 @@ def parse_sample_to_manifest_item(
     split: str,
     source_revision: str,
     sample_index: int,
+    output_dir: Optional[Union[str, Path]] = None,
 ) -> Optional[ManifestItem]:
     """Convert raw dataset dictionary item into canonical ManifestItem."""
     sample_id = str(sample.get("id") or sample.get("sample_id") or f"{split}_{sample_index:06d}")
@@ -41,13 +42,22 @@ def parse_sample_to_manifest_item(
 
     # Audio metadata
     audio_info = sample.get("audio", {})
+    audio_relpath = f"audio/{split}/{sample_id}.wav"
     if isinstance(audio_info, dict):
-        audio_path = audio_info.get("path", f"audio/{split}/{sample_id}.wav")
         sample_rate = int(audio_info.get("sampling_rate", 16000))
         audio_array = audio_info.get("array")
+        existing_path = audio_info.get("path")
+
+        # If output_dir is provided and audio_array is decoded in memory, write local wav file
+        if output_dir is not None and audio_array is not None:
+            dest_audio_path = Path(output_dir) / audio_relpath
+            if not dest_audio_path.exists():
+                dest_audio_path.parent.mkdir(parents=True, exist_ok=True)
+                import soundfile as sf
+                sf.write(str(dest_audio_path), audio_array, sample_rate, subtype="PCM_16")
+
         num_samples = len(audio_array) if audio_array is not None else int(sample.get("num_samples", 0))
     else:
-        audio_path = f"audio/{split}/{sample_id}.wav"
         sample_rate = 16000
         num_samples = int(sample.get("num_samples", 0))
 
@@ -56,7 +66,7 @@ def parse_sample_to_manifest_item(
     return ManifestItem(
         sample_id=sample_id,
         split=split,
-        audio_relpath=audio_path,
+        audio_relpath=audio_relpath,
         source_revision=source_revision,
         sample_rate=sample_rate,
         num_samples=num_samples,
@@ -99,7 +109,9 @@ def prepare_manifests_from_hf(
 
         items: List[ManifestItem] = []
         for idx, sample in enumerate(ds):
-            item = parse_sample_to_manifest_item(sample, canonical_split, source_revision, idx)
+            item = parse_sample_to_manifest_item(
+                sample, canonical_split, source_revision, idx, output_dir=out_p
+            )
             if item is not None:
                 items.append(item)
 

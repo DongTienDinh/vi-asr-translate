@@ -39,7 +39,9 @@ def patch_01():
         "\n",
         "# Cài đặt package vi-asr ở chế độ editable\n",
         "%cd /kaggle/working/vi_asr_project\n",
-        "!pip install -q -e .\n"
+        "!pip install -q -e .\n",
+        "import vi_asr\n",
+        "print('vi_asr successfully installed from:', vi_asr.__file__)\n"
     ]
     nb["cells"][3]["source"] = [
         "# 3. Chuẩn bị manifests dữ liệu từ Hugging Face\n",
