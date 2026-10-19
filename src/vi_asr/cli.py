@@ -94,6 +94,8 @@ def cmd_audit(args: argparse.Namespace) -> int:
 
 def cmd_prepare_data(args: argparse.Namespace) -> int:
     """Download/Stream ViMD and prepare canonical manifests and audio."""
+    from vi_asr.data.prepare import prepare_manifests_from_hf
+
     logger.info("Running prepare-data...")
     cfg = resolve_config(
         base_path=args.config,
@@ -105,8 +107,33 @@ def cmd_prepare_data(args: argparse.Namespace) -> int:
     data_root = Path(cfg["paths"]["data_root"])
     data_root.mkdir(parents=True, exist_ok=True)
     logger.info("Target data root: %s", data_root)
-    logger.info("In Kaggle environment, add Hugging Face dataset nguyendv02/ViMD_Dataset or run prepare_manifests_from_hf.")
-    return 0
+
+    # Check if manifests already exist in data_root or manifests/ subdirectory
+    train_manifest = data_root / "train.jsonl"
+    if not train_manifest.exists():
+        train_manifest = data_root / "manifests" / "train.jsonl"
+
+    if train_manifest.exists():
+        logger.info("Manifests already exist at %s. Skipping download/generation.", train_manifest)
+        return 0
+
+    hf_id = cfg.get("data", {}).get("hf_id", "nguyendv02/ViMD_Dataset")
+    revision = cfg.get("data", {}).get("revision", "3a5b30157034e7eadd5c75fae1a820c6f9383398")
+    logger.info("Loading dataset %s (revision: %s)...", hf_id, revision)
+    try:
+        from datasets import load_dataset
+
+        ds = load_dataset(hf_id, revision=revision)
+        manifest_paths = prepare_manifests_from_hf(ds, output_dir=data_root, source_revision=revision)
+        logger.info("Successfully prepared manifests: %s", manifest_paths)
+        return 0
+    except Exception as e:
+        logger.error("Failed to prepare dataset from Hugging Face: %s", e)
+        logger.info(
+            "If running offline or with pre-downloaded files, place train.jsonl, valid.jsonl, test.jsonl in %s",
+            data_root,
+        )
+        return 1
 
 
 def cmd_build_tokenizer(args: argparse.Namespace) -> int:
