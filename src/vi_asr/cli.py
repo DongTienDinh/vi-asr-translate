@@ -46,6 +46,39 @@ def add_common_config_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _get_writable_path(cfg_path: str | Path, default_fallback: str) -> Path:
+    p = Path(cfg_path)
+    if str(p).startswith("/kaggle/input"):
+        logger.warning(
+            "Config path '%s' is in read-only /kaggle/input. Redirecting to writable path: '%s'.",
+            p,
+            default_fallback,
+        )
+        p = Path(default_fallback)
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def _find_readable_path(cfg_path: str | Path, fallback: str, check_file: Optional[str] = None) -> Path:
+    p = Path(cfg_path)
+    if check_file:
+        if (p / check_file).exists() or (p / "manifests" / check_file).exists():
+            return p
+    elif p.exists():
+        return p
+
+    fallback_p = Path(fallback)
+    if check_file:
+        if (fallback_p / check_file).exists() or (fallback_p / "manifests" / check_file).exists():
+            logger.info("Path '%s' not found. Falling back to: '%s'.", p, fallback_p)
+            return fallback_p
+    elif fallback_p.exists():
+        logger.info("Path '%s' not found. Falling back to: '%s'.", p, fallback_p)
+        return fallback_p
+
+    return p
+
+
 def cmd_audit(args: argparse.Namespace) -> int:
     """Audit environment, configuration, and data integrity."""
     logger.info("Running preflight configuration and environment audit...")
@@ -64,7 +97,7 @@ def cmd_audit(args: argparse.Namespace) -> int:
     logger.info("Saved resolved configuration to %s", report_dir / "resolved_config.yaml")
 
     # Run data manifest audit if data manifests exist
-    data_root = Path(cfg["paths"]["data_root"])
+    data_root = _find_readable_path(cfg["paths"]["data_root"], "/kaggle/working/artifacts/prepared", check_file="train.jsonl")
     train_manifest = data_root / "train.jsonl"
     if not train_manifest.exists():
         train_manifest = data_root / "manifests" / "train.jsonl"
@@ -104,8 +137,7 @@ def cmd_prepare_data(args: argparse.Namespace) -> int:
         paths_path=args.paths,
         overrides=args.override,
     )
-    data_root = Path(cfg["paths"]["data_root"])
-    data_root.mkdir(parents=True, exist_ok=True)
+    data_root = _get_writable_path(cfg["paths"]["data_root"], "/kaggle/working/artifacts/prepared")
     logger.info("Target data root: %s", data_root)
 
     # Check if manifests already exist in data_root or manifests/ subdirectory
@@ -149,7 +181,7 @@ def cmd_build_tokenizer(args: argparse.Namespace) -> int:
         paths_path=args.paths,
         overrides=args.override,
     )
-    data_root = Path(cfg["paths"]["data_root"])
+    data_root = _find_readable_path(cfg["paths"]["data_root"], "/kaggle/working/artifacts/prepared", check_file="train.jsonl")
     train_manifest = data_root / "train.jsonl"
     if not train_manifest.exists():
         train_manifest = data_root / "manifests" / "train.jsonl"
@@ -167,7 +199,8 @@ def cmd_build_tokenizer(args: argparse.Namespace) -> int:
     pad_id = int(tok_cfg.get("pad_id", 0))
     unk_id = int(tok_cfg.get("unk_id", 1))
 
-    out_dir = Path(cfg["paths"]["project_root"]) / "artifacts" / "tokenizer"
+    proj_root = _get_writable_path(cfg["paths"]["project_root"], "/kaggle/working/vi_asr_project")
+    out_dir = proj_root / "artifacts" / "tokenizer"
     model_prefix = out_dir / f"bpe_{vocab_size}"
 
     model_path = train_bpe_tokenizer(
@@ -198,8 +231,8 @@ def cmd_cache_teacher(args: argparse.Namespace) -> int:
         paths_path=args.paths,
         overrides=args.override,
     )
-    data_root = Path(cfg["paths"]["data_root"])
     split_name = getattr(args, "split", "train")
+    data_root = _find_readable_path(cfg["paths"]["data_root"], "/kaggle/working/artifacts/prepared", check_file=f"{split_name}.jsonl")
     manifest_file = data_root / f"{split_name}.jsonl"
     if not manifest_file.exists():
         manifest_file = data_root / "manifests" / f"{split_name}.jsonl"
@@ -217,7 +250,7 @@ def cmd_cache_teacher(args: argparse.Namespace) -> int:
     device = getattr(args, "device", "cpu")
 
     extractor = PhoBERTTeacherExtractor(model_id=model_id, revision=revision, device=device)
-    cache_dir = Path(cfg["paths"]["teacher_root"])
+    cache_dir = _get_writable_path(cfg["paths"]["teacher_root"], "/kaggle/working/artifacts/teacher_cache")
     build_offline_teacher_cache(items, cache_dir, extractor)
     logger.info("Teacher cache generation complete: saved to %s", cache_dir)
     return 0

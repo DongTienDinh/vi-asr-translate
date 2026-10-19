@@ -34,6 +34,33 @@ def patch_01():
         "%cd /kaggle/working/vi_asr_project\n",
         "!pip install -q -e .\n"
     ]
+    nb["cells"][3]["source"] = [
+        "# 3. Chuẩn bị manifests dữ liệu từ Hugging Face\n",
+        "!python -m vi_asr prepare-data \\\n",
+        "    --config configs/base.yaml \\\n",
+        "    --paths configs/paths/kaggle_prepare.yaml\n"
+    ]
+    nb["cells"][4]["source"] = [
+        "# 4. Huấn luyện SentencePiece BPE Tokenizer (Train-only)\n",
+        "!python -m vi_asr build-tokenizer \\\n",
+        "    --config configs/base.yaml \\\n",
+        "    --paths configs/paths/kaggle_prepare.yaml\n"
+    ]
+    nb["cells"][5]["source"] = [
+        "# 5. Sinh PhoBERT Offline Token Cache cho tập Train\n",
+        "!python -m vi_asr cache-teacher \\\n",
+        "    --config configs/base.yaml \\\n",
+        "    --paths configs/paths/kaggle_prepare.yaml \\\n",
+        "    --split train \\\n",
+        "    --device cuda:0\n"
+    ]
+    nb["cells"][6]["source"] = [
+        "# 6. Kiểm toán toàn diện phân chia dữ liệu và rà soát Leakage (Gate G1)\n",
+        "!python -m vi_asr audit \\\n",
+        "    --config configs/base.yaml \\\n",
+        "    --paths configs/paths/kaggle_prepare.yaml \\\n",
+        "    --report-dir artifacts/audit_report\n"
+    ]
     with open(p, "w", encoding="utf-8") as f:
         json.dump(nb, f, indent=1, ensure_ascii=False)
     print("Patched 01_prepare.ipynb")
