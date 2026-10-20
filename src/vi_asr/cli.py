@@ -227,6 +227,100 @@ def cmd_prepare_data(args: argparse.Namespace) -> int:
         return 1
 
 
+def cmd_fetch_audio(args: argparse.Namespace) -> int:
+    """Download/Stream ViMD audio files into local storage."""
+    logger.info("Running fetch-audio...")
+    cfg = resolve_config(
+        base_path=args.config,
+        variant_path=args.variant,
+        profile_path=args.profile,
+        paths_path=args.paths,
+        overrides=args.override,
+    )
+
+    dest_dir = Path("/kaggle/working/artifacts/prepared")
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    audio_dest = dest_dir / "audio"
+    audio_dest.mkdir(parents=True, exist_ok=True)
+
+    # 1. First, check if an existing audio archive (.tar, .tar.gz, .zip) is present in /kaggle/input or working
+    kaggle_input = Path("/kaggle/input")
+    found_archive = None
+    if kaggle_input.exists():
+        for pat in ["*audio*.tar*", "*audio*.zip", "*prepared*.tar*"]:
+            for arch in kaggle_input.rglob(pat):
+                if arch.is_file():
+                    found_archive = arch
+                    break
+            if found_archive:
+                break
+
+    if found_archive:
+        logger.info("Found audio archive at %s. Extracting into %s...", found_archive, dest_dir)
+        import tarfile
+        import zipfile
+        if str(found_archive).endswith(".zip"):
+            with zipfile.ZipFile(found_archive, "r") as zf:
+                zf.extractall(dest_dir)
+        else:
+            with tarfile.open(found_archive, "r:*") as tf:
+                tf.extractall(dest_dir)
+        logger.info("Extracted audio archive successfully.")
+        return 0
+
+    # 2. Check if audio files already exist locally
+    split = getattr(args, "split", "train") or "train"
+    split_audio_dir = audio_dest / split
+    split_audio_dir.mkdir(parents=True, exist_ok=True)
+    existing_wavs = list(split_audio_dir.glob("*.wav"))
+    max_samples = getattr(args, "max_samples", None)
+
+    if max_samples and len(existing_wavs) >= max_samples:
+        logger.info("Already found %d audio files in %s. Skipping download.", len(existing_wavs), split_audio_dir)
+        return 0
+
+    # 3. Stream from Hugging Face
+    hf_id = cfg.get("data", {}).get("hf_id", "nguyendv02/ViMD_Dataset")
+    revision = cfg.get("data", {}).get("revision", "3a5b30157034e7eadd5c75fae1a820c6f9383398")
+    logger.info("Streaming %s split from %s (target: %s, max_samples: %s)...", split, hf_id, split_audio_dir, max_samples)
+
+    try:
+        from datasets import Audio, load_dataset
+        import soundfile as sf
+        from tqdm import tqdm
+
+        ds = load_dataset(hf_id, revision=revision, streaming=True)
+        actual_split = split
+        if actual_split not in ds:
+            if split == "valid" and "validation" in ds:
+                actual_split = "validation"
+
+        stream_split = ds[actual_split].cast_column("audio", Audio(sampling_rate=16000))
+        count = len(existing_wavs)
+        total_target = max_samples if max_samples else 15000
+
+        pbar = tqdm(total=total_target, initial=count, desc=f"Fetching {split} audio")
+        for idx, sample in enumerate(stream_split):
+            sample_id = str(sample.get("id") or sample.get("sample_id") or f"{split}_{idx:06d}")
+            out_file = split_audio_dir / f"{sample_id}.wav"
+            if not out_file.exists():
+                audio_arr = sample["audio"]["array"]
+                sr = sample["audio"]["sampling_rate"]
+                sf.write(str(out_file), audio_arr, sr, subtype="PCM_16")
+                count += 1
+                pbar.update(1)
+
+            if max_samples and count >= max_samples:
+                break
+        pbar.close()
+
+        logger.info("Completed fetching audio: %d files ready in %s.", count, split_audio_dir)
+        return 0
+    except Exception as e:
+        logger.error("Failed to fetch audio from Hugging Face: %s", e)
+        return 1
+
+
 def cmd_build_tokenizer(args: argparse.Namespace) -> int:
     """Build SentencePiece BPE tokenizer exclusively from train split."""
     from vi_asr.data.manifest import load_manifest
@@ -865,6 +959,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Stream dataset directly to WAVs instead of downloading full raw parquets (avoids out-of-disk)",
     )
     p_prep.set_defaults(func=cmd_prepare_data)
+
+    # fetch-audio
+    p_audio = subparsers.add_parser("fetch-audio", help="Download/stream ViMD audio files to local storage")
+    add_common_config_args(p_audio)
+    p_audio.add_argument("--split", type=str, default="train", help="Dataset split to fetch (train/valid/test)")
+    p_audio.add_argument("--max-samples", type=int, default=None, help="Maximum number of audio files to fetch")
+    p_audio.set_defaults(func=cmd_fetch_audio)
 
     # build-tokenizer
     p_tok = subparsers.add_parser("build-tokenizer", help="Train SentencePiece BPE tokenizer")

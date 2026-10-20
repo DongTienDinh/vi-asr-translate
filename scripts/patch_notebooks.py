@@ -77,6 +77,23 @@ def patch_01():
         "    --paths configs/paths/kaggle_prepare.yaml \\\n",
         "    --report-dir artifacts/audit_report\n"
     ]
+    # Cell 7: Archive audio to single tar.gz to protect against Kaggle's 500-file limit
+    archive_cell = {
+        "cell_type": "code",
+        "execution_count": None,
+        "metadata": {},
+        "outputs": [],
+        "source": [
+            "# 7. Đóng gói Audio thành file archive duy nhất (Bảo vệ dữ liệu không bị giới hạn 500 file của Kaggle)\n",
+            "!tar -czf /kaggle/working/artifacts/prepared_audio.tar.gz -C /kaggle/working/artifacts/prepared audio\n",
+            "print('Đã đóng gói prepared_audio.tar.gz thành công để đính kèm sang Notebook 02!')\n"
+        ]
+    }
+    if len(nb["cells"]) <= 7:
+        nb["cells"].append(archive_cell)
+    else:
+        nb["cells"][7] = archive_cell
+
     with open(p, "w", encoding="utf-8") as f:
         json.dump(nb, f, indent=1, ensure_ascii=False)
     print("Patched 01_prepare.ipynb")
@@ -91,6 +108,43 @@ def patch_02():
         *COMMON_INIT_SNIPPET,
         "!python -m vi_asr --help\n"
     ]
+
+    fetch_audio_cell = {
+        "cell_type": "code",
+        "execution_count": None,
+        "metadata": {},
+        "outputs": [],
+        "source": [
+            "# 3. Chuẩn bị Audio Thực tế vào /kaggle/working/artifacts/prepared/audio\n",
+            "# Tải trước các mẫu âm thanh thật (hoặc giải nén nếu có archive) để chạy mượt mà Pilot Test và Huấn luyện\n",
+            "!python -m vi_asr fetch-audio \\\n",
+            "    --config configs/base.yaml \\\n",
+            "    --paths configs/paths/kaggle.yaml \\\n",
+            "    --split train \\\n",
+            "    --max-samples 3500\n"
+        ]
+    }
+
+    # Check if fetch-audio is already present
+    has_fetch = any("fetch-audio" in "".join(c.get("source", [])) for c in nb["cells"])
+    if not has_fetch:
+        # Insert after cell 2
+        nb["cells"].insert(3, fetch_audio_cell)
+    else:
+        for i, c in enumerate(nb["cells"]):
+            if "fetch-audio" in "".join(c.get("source", [])):
+                nb["cells"][i] = fetch_audio_cell
+                break
+
+    # Renumber subsequent cells comments
+    num = 4
+    for i in range(4, len(nb["cells"])):
+        src = nb["cells"][i].get("source", [])
+        if src and src[0].startswith("# "):
+            old_title = src[0].split(". ", 1)[-1] if ". " in src[0] else src[0][2:]
+            src[0] = f"# {num}. {old_title}"
+            num += 1
+
     with open(p, "w", encoding="utf-8") as f:
         json.dump(nb, f, indent=1, ensure_ascii=False)
     print("Patched 02_train_t4x2.ipynb")
