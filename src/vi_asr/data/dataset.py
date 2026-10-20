@@ -108,7 +108,10 @@ class ASRDataset(Dataset):
 
         # 3. Apply SpecAugment during training if enabled
         if self.is_train and self.specaugment is not None:
-            feats = self.specaugment(feats)
+            aug_out = self.specaugment(feats)
+            feats = aug_out[0] if isinstance(aug_out, tuple) else aug_out
+            if feats.ndim == 3:
+                feats = feats.squeeze(0)
 
         # 4. Tokenize target transcript for CTC
         target_ids = self.tokenizer.encode(item.text_asr)

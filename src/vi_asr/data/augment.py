@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import random
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 import torch
 import torch.nn as nn
 
@@ -40,21 +40,27 @@ class SpecAugment(nn.Module):
         self,
         feats: torch.Tensor,
         feat_lengths: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, Optional[torch.Tensor]]]:
         """Args:
-
-            feats: Tensor of shape [B, T, F] (mel filterbanks)
-            feat_lengths: Tensor of shape [B] (actual valid frames)
+            feats: Tensor of shape [B, T, F] or [T, F] (mel filterbanks)
+            feat_lengths: Optional tensor of shape [B] (actual valid frames)
 
         Returns:
-            augmented_feats: Tensor of shape [B, T, F]
-            feat_lengths: Unchanged valid lengths
+            augmented_feats: Tensor of shape [B, T, F] or [T, F]
+            feat_lengths: Unchanged valid lengths (if input was 3D or feat_lengths was provided)
         """
+        is_2d = (feats.ndim == 2)
         if not self.training:
+            if is_2d and feat_lengths is None:
+                return feats
             return feats, feat_lengths
 
         # Clone so input is not modified in-place
-        augmented = feats.clone()
+        if is_2d:
+            augmented = feats.unsqueeze(0).clone()
+        else:
+            augmented = feats.clone()
+
         B, T, F = augmented.shape
 
         for b in range(B):
@@ -75,5 +81,8 @@ class SpecAugment(nn.Module):
                 if t_width > 0 and valid_T > t_width:
                     t_start = random.randint(0, valid_T - t_width)
                     augmented[b, t_start : t_start + t_width, :] = fill_val
+
+        if is_2d and feat_lengths is None:
+            return augmented.squeeze(0)
 
         return augmented, feat_lengths
