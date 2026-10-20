@@ -15,6 +15,9 @@ from vi_asr.data.frontend import KaldiFrontend
 from vi_asr.data.manifest import ManifestItem
 from vi_asr.data.teacher_cache import TeacherCacheReader
 from vi_asr.data.tokenizer import Tokenizer
+from vi_asr.utils.logging import setup_logger
+
+logger = setup_logger("vi_asr.data.dataset")
 
 
 class ASRDataset(Dataset):
@@ -44,16 +47,31 @@ class ASRDataset(Dataset):
 
     def load_waveform(self, item: ManifestItem) -> torch.Tensor:
         """Load audio waveform tensor [1, T] at 16kHz."""
+        candidates: List[Path] = []
         if self.audio_root and item.audio_relpath:
-            audio_path = self.audio_root / item.audio_relpath
-            if not audio_path.exists():
-                # Try absolute path or fallback
-                audio_path = Path(item.audio_relpath)
-        else:
-            audio_path = Path(item.audio_relpath)
+            candidates.append(self.audio_root / item.audio_relpath)
+            candidates.append(self.audio_root / Path(item.audio_relpath).name)
+        if item.audio_relpath:
+            candidates.append(Path(item.audio_relpath))
+            candidates.append(Path("/kaggle/working/artifacts/prepared") / item.audio_relpath)
 
-        if not audio_path.exists():
-            raise FileNotFoundError(f"Audio file not found: {audio_path}")
+        audio_path: Optional[Path] = None
+        for c in candidates:
+            if c.exists() and c.is_file():
+                audio_path = c
+                break
+
+        if audio_path is None and item.audio_relpath:
+            fname = Path(item.audio_relpath).name
+            kaggle_input = Path("/kaggle/input")
+            if kaggle_input.exists():
+                for found in kaggle_input.rglob(fname):
+                    if found.is_file():
+                        audio_path = found
+                        break
+
+        if audio_path is None or not audio_path.exists():
+            raise FileNotFoundError(f"Audio file not found for sample {item.sample_id}: {item.audio_relpath}")
 
         wav_np, sr = sf.read(str(audio_path), dtype="float32")
         if wav_np.ndim > 1:
@@ -65,8 +83,24 @@ class ASRDataset(Dataset):
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         item = self.items[idx]
 
-        # 1. Load waveform
-        waveform = self.load_waveform(item)
+        # 1. Load waveform with graceful fallback if individual audio file is missing
+        try:
+            waveform = self.load_waveform(item)
+        except FileNotFoundError as e:
+            logger.warning("Missing audio file for %s (%s). Attempting adjacent sample fallback.", item.sample_id, e)
+            waveform = None
+            for offset in range(1, min(50, len(self.items))):
+                alt_idx = (idx + offset) % len(self.items)
+                try:
+                    alt_item = self.items[alt_idx]
+                    waveform = self.load_waveform(alt_item)
+                    item = alt_item
+                    break
+                except FileNotFoundError:
+                    continue
+            if waveform is None:
+                logger.warning("No audio candidates found. Using 1.0s silence placeholder for %s.", item.sample_id)
+                waveform = torch.zeros(1, 16000, dtype=torch.float32)
 
         # 2. Extract 80-mel filterbank (KaldiFrontend handles scale 32768.0 and CMVN)
         feats, _ = self.frontend(waveform)

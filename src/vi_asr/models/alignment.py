@@ -13,7 +13,7 @@ Adaptation from MFGCN text-conditioned acoustic pooling:
 from __future__ import annotations
 
 import math
-from typing import Dict, Optional, Tuple, Union
+from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -41,12 +41,25 @@ class TokenFramePoolingAlignment(nn.Module):
         temporal_prior_enabled: bool = False,
         beta: float = 0.1,
         sigma: float = 0.2,
+        use_temporal_prior: Optional[bool] = None,
+        temporal_strength: Optional[float] = None,
+        temporal_sigma: Optional[float] = None,
+        **kwargs: Any,
     ):
         super().__init__()
         self.audio_dim = audio_dim
         self.teacher_dim = teacher_dim
         self.score_dim = score_dim
         self.temperature = float(temperature)
+
+        # Allow alias keywords from CLI or config
+        if use_temporal_prior is not None:
+            temporal_prior_enabled = use_temporal_prior
+        if temporal_strength is not None:
+            beta = temporal_strength
+        if temporal_sigma is not None:
+            sigma = temporal_sigma
+
         self.temporal_prior_enabled = bool(temporal_prior_enabled)
         self.beta = float(beta)
         self.sigma = float(sigma)

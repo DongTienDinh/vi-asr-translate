@@ -486,9 +486,9 @@ def _run_ddp_training(args: argparse.Namespace, max_updates: Optional[int] = Non
             teacher_dim=int(align_cfg.get("prediction_dim", 768)),
             score_dim=int(align_cfg.get("score_dim", 256)),
             temperature=float(align_cfg.get("temperature", 0.1)),
-            use_temporal_prior=bool(temp_cfg.get("enabled", False)),
-            temporal_sigma=float(temp_cfg.get("sigma_normalized", 0.2)),
-            temporal_strength=float(temp_cfg.get("strength", 0.1)),
+            temporal_prior_enabled=bool(temp_cfg.get("enabled", False)),
+            sigma=float(temp_cfg.get("sigma_normalized", 0.2)),
+            beta=float(temp_cfg.get("strength", 0.1)),
         )
 
     system = TinyASRSystem(asr_model=asr_model, alignment_module=alignment_module).to(device)

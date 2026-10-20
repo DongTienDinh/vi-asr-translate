@@ -105,13 +105,19 @@ def load_vip_vl_pretrained(
     for k, v in state_dict.items():
         if k.startswith("encoder."):
             clean_k = k[len("encoder.") :]
-            encoder_keys[clean_k] = v
+            if "global_cmvn" in clean_k or "cmvn" in clean_k:
+                ignored_keys.append(k)
+            else:
+                encoder_keys[clean_k] = v
         elif k.startswith("speech_encoder."):
             clean_k = k[len("speech_encoder.") :]
-            encoder_keys[clean_k] = v
+            if "global_cmvn" in clean_k or "cmvn" in clean_k:
+                ignored_keys.append(k)
+            else:
+                encoder_keys[clean_k] = v
         elif k.startswith("quantizer.") or k.startswith("project_to_latent.") or k.startswith("final_proj."):
             ignored_keys.append(k)
-        elif "mlm" in k or "loss" in k:
+        elif "mlm" in k or "loss" in k or "cmvn" in k:
             ignored_keys.append(k)
         else:
             # Check if k matches directly without prefix

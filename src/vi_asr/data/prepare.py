@@ -54,7 +54,14 @@ def parse_sample_to_manifest_item(
             if not dest_audio_path.exists():
                 dest_audio_path.parent.mkdir(parents=True, exist_ok=True)
                 import soundfile as sf
-                sf.write(str(dest_audio_path), audio_array, sample_rate, subtype="PCM_16")
+                try:
+                    sf.write(str(dest_audio_path), audio_array, sample_rate, subtype="PCM_16")
+                except Exception as write_err:
+                    logger.warning("Could not write audio file %s: %s", dest_audio_path, write_err)
+                    return None
+        elif audio_array is None and not existing_path:
+            logger.warning("Sample %s has no audio array or path, skipping.", sample_id)
+            return None
 
         num_samples = len(audio_array) if audio_array is not None else int(sample.get("num_samples", 0))
     else:
