@@ -60,7 +60,44 @@ def _get_writable_path(cfg_path: str | Path, default_fallback: str) -> Path:
     return p
 
 
+def _find_file(filepath: str | Path, fallback_dir: Optional[str] = None) -> Path:
+    """Find a specific file across current directory, parent dirs, /kaggle/working, and /kaggle/input."""
+    p = Path(filepath)
+    if p.exists() and p.is_file():
+        return p
+
+    fname = p.name
+    candidates = [
+        Path.cwd() / p,
+        Path.cwd().parent / p,
+        Path("/kaggle/working") / p,
+        Path("/kaggle/working/vi_asr_project") / p,
+    ]
+    if fallback_dir:
+        candidates.append(Path(fallback_dir) / fname)
+        candidates.append(Path(fallback_dir) / p)
+
+    for c in candidates:
+        if c.exists() and c.is_file():
+            return c
+
+    # Search in /kaggle/input if running on Kaggle
+    kaggle_input = Path("/kaggle/input")
+    if kaggle_input.exists():
+        for found in kaggle_input.rglob(fname):
+            if found.is_file():
+                logger.info("Auto-discovered file '%s' at: '%s'.", fname, found)
+                return found
+
+    for found in Path.cwd().rglob(fname):
+        if found.is_file() and not str(found).startswith(str(Path.cwd() / ".git")):
+            return found
+
+    return p
+
+
 def _find_readable_path(cfg_path: str | Path, fallback: str, check_file: Optional[str] = None) -> Path:
+    """Find a directory path containing check_file or existing directory."""
     p = Path(cfg_path)
     if check_file:
         if (p / check_file).exists() or (p / "manifests" / check_file).exists():
@@ -76,6 +113,16 @@ def _find_readable_path(cfg_path: str | Path, fallback: str, check_file: Optiona
     elif fallback_p.exists():
         logger.info("Path '%s' not found. Falling back to: '%s'.", p, fallback_p)
         return fallback_p
+
+    # Search /kaggle/input for folder containing check_file
+    kaggle_input = Path("/kaggle/input")
+    if kaggle_input.exists() and check_file:
+        for candidate in kaggle_input.rglob(check_file):
+            target_dir = candidate.parent
+            if target_dir.name == "manifests":
+                target_dir = target_dir.parent
+            logger.info("Auto-discovered '%s' at directory: '%s'.", check_file, target_dir)
+            return target_dir
 
     return p
 
@@ -152,14 +199,22 @@ def cmd_prepare_data(args: argparse.Namespace) -> int:
 
     hf_id = cfg.get("data", {}).get("hf_id", "nguyendv02/ViMD_Dataset")
     revision = cfg.get("data", {}).get("revision", "3a5b30157034e7eadd5c75fae1a820c6f9383398")
-    logger.info("Loading dataset %s (revision: %s)...", hf_id, revision)
+    streaming = getattr(args, "streaming", True)
+    logger.info("Loading dataset %s (revision: %s, streaming=%s)...", hf_id, revision, streaming)
     try:
-        from datasets import load_dataset
+        from datasets import Audio, load_dataset
 
-        cache_dir = os.environ.get("HF_DATASETS_CACHE") or ("/tmp/huggingface/datasets" if Path("/kaggle").exists() else None)
-        if cache_dir:
-            Path(cache_dir).mkdir(parents=True, exist_ok=True)
-        ds = load_dataset(hf_id, revision=revision, cache_dir=cache_dir)
+        if streaming:
+            logger.info("Streaming enabled: streaming records on the fly directly to WAVs to prevent out-of-disk on Kaggle.")
+            ds = load_dataset(hf_id, revision=revision, streaming=True)
+            ds = ds.cast_column("audio", Audio(sampling_rate=16000))
+        else:
+            cache_dir = os.environ.get("HF_DATASETS_CACHE") or (str(data_root / ".hf_cache") if Path("/kaggle").exists() else None)
+            if cache_dir:
+                Path(cache_dir).mkdir(parents=True, exist_ok=True)
+            ds = load_dataset(hf_id, revision=revision, cache_dir=cache_dir)
+            ds = ds.cast_column("audio", Audio(sampling_rate=16000))
+
         manifest_paths = prepare_manifests_from_hf(ds, output_dir=data_root, source_revision=revision)
         logger.info("Successfully prepared manifests: %s", manifest_paths)
         return 0
@@ -284,51 +339,503 @@ def cmd_smoke(args: argparse.Namespace) -> int:
 
 
 
+def _run_ddp_training(args: argparse.Namespace, max_updates: Optional[int] = None) -> int:
+    import json
+    import torch
+    from torch.utils.data import DataLoader
+    from vi_asr.data.collate import asr_collate_fn
+    from vi_asr.data.dataset import ASRDataset
+    from vi_asr.data.frontend import KaldiFrontend
+    from vi_asr.data.manifest import load_manifest
+    from vi_asr.data.teacher_cache import TeacherCacheReader
+    from vi_asr.data.tokenizer import Tokenizer
+    from vi_asr.data.augment import SpecAugment
+    from vi_asr.models.ctc_asr import ViPViCTCASR
+    from vi_asr.models.encoder_adapter import ChunkFormerEncoderAdapter
+    from vi_asr.models.checkpoint import load_vip_vl_pretrained
+    from vi_asr.models.alignment import TokenFramePoolingAlignment
+    from vi_asr.training.distributed import init_distributed, cleanup_distributed
+    from vi_asr.training.distributed_sampler import GlobalDurationSampler, ValidationShardSampler
+    from vi_asr.training.overfit import TinyASRSystem
+    from vi_asr.training.trainer import DDPASTrainer, create_warmup_linear_scheduler
+
+    cfg = resolve_config(
+        base_path=args.config,
+        variant_path=args.variant,
+        profile_path=args.profile,
+        paths_path=args.paths,
+        overrides=args.override,
+    )
+
+    rank, world_size, local_rank = init_distributed()
+    seed = int(getattr(args, "seed", 42)) + rank
+    torch.manual_seed(seed)
+
+    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+
+    # 1. Locate data manifests
+    data_root = _find_readable_path(cfg["paths"]["data_root"], "/kaggle/working/artifacts/prepared", check_file="train.jsonl")
+    train_manifest = data_root / "train.jsonl"
+    if not train_manifest.exists():
+        train_manifest = data_root / "manifests" / "train.jsonl"
+
+    if not train_manifest.exists():
+        logger.error("Train manifest not found at %s. Please run prepare-data first.", train_manifest)
+        return 1
+
+    train_items = load_manifest(train_manifest)
+
+    valid_manifest = data_root / "valid.jsonl"
+    if not valid_manifest.exists():
+        valid_manifest = data_root / "manifests" / "valid.jsonl"
+    val_items = load_manifest(valid_manifest) if valid_manifest.exists() else []
+
+    # 2. Tokenizer
+    tok_dir = _find_readable_path(Path(cfg["paths"]["project_root"]) / "artifacts" / "tokenizer", "/kaggle/working/vi_asr_project/artifacts/tokenizer", check_file="bpe_1024.model")
+    tok_path = tok_dir / "bpe_1024.model"
+    if not tok_path.exists():
+        tok_path = _find_file("bpe_1024.model")
+
+    if not tok_path.exists():
+        logger.error("Tokenizer not found at %s. Please run build-tokenizer first.", tok_path)
+        return 1
+
+    tokenizer = Tokenizer(tok_path)
+
+    # 3. Frontend & Teacher reader
+    fe_cfg = cfg.get("frontend", {})
+    frontend = KaldiFrontend(
+        sample_rate=int(fe_cfg.get("sample_rate", 16000)),
+        num_mel_bins=int(fe_cfg.get("num_mel_bins", 80)),
+        frame_length_ms=float(fe_cfg.get("frame_length_ms", 25.0)),
+        frame_shift_ms=float(fe_cfg.get("frame_shift_ms", 10.0)),
+        fbank_waveform_multiplier=float(fe_cfg.get("fbank_waveform_multiplier", 32768.0)),
+    )
+
+    teacher_reader = None
+    if cfg.get("alignment", {}).get("enabled", False):
+        teacher_root = _find_readable_path(cfg["paths"]["teacher_root"], "/kaggle/working/artifacts/teacher_cache", check_file="tokens-000.npy")
+        if (teacher_root / "tokens-000.npy").exists():
+            teacher_reader = TeacherCacheReader(teacher_root)
+        else:
+            logger.warning("Alignment enabled but teacher cache not found at %s.", teacher_root)
+
+    # 4. Augmentation & Datasets
+    aug_cfg = cfg.get("augmentation", {})
+    specaug = None
+    if aug_cfg.get("specaugment", True):
+        specaug = SpecAugment(
+            freq_masks=int(aug_cfg.get("freq_masks", 2)),
+            freq_max_bins=int(aug_cfg.get("freq_max_bins", 8)),
+            time_masks=int(aug_cfg.get("time_masks", 2)),
+            time_max_frames=int(aug_cfg.get("time_max_frames", 30)),
+        )
+
+    train_ds = ASRDataset(
+        manifest_items=train_items,
+        frontend=frontend,
+        tokenizer=tokenizer,
+        audio_root=data_root,
+        specaugment=specaug,
+        teacher_reader=teacher_reader,
+        is_train=True,
+    )
+
+    val_ds = None
+    if val_items:
+        val_ds = ASRDataset(
+            manifest_items=val_items,
+            frontend=frontend,
+            tokenizer=tokenizer,
+            audio_root=data_root,
+            specaugment=None,
+            teacher_reader=None,
+            is_train=False,
+        )
+
+    # 5. Model construction
+    m_cfg = cfg.get("model", {})
+    adapter = ChunkFormerEncoderAdapter(
+        input_size=int(fe_cfg.get("num_mel_bins", 80)),
+        output_size=512,
+        attention_heads=8,
+        linear_units=2048,
+        num_blocks=12,
+        dropout_rate=float(m_cfg.get("ctc_head_dropout", 0.0)),
+        encoder_layerdrop=float(m_cfg.get("encoder_layerdrop_override", 0.0)),
+        cnn_module_kernel=15,
+        dynamic_conv=True,
+        gradient_checkpointing=bool(m_cfg.get("activation_checkpointing", True)),
+    )
+
+    encoder_id = m_cfg.get("encoder_id", "khanhld/vip-vl-base-vie")
+    encoder_rev = m_cfg.get("encoder_revision", "4b259337d96450d57403acdee82572c587151e22")
+    try:
+        load_vip_vl_pretrained(adapter, checkpoint_path_or_repo=encoder_id, revision=encoder_rev)
+    except Exception as e:
+        logger.warning("Could not load pretrained ViP-VL weights from %s: %s", encoder_id, e)
+
+    asr_model = ViPViCTCASR(adapter, vocab_size=tokenizer.vocab_size, blank_id=0)
+
+    alignment_module = None
+    align_cfg = cfg.get("alignment", {})
+    if align_cfg.get("enabled", False):
+        temp_cfg = align_cfg.get("temporal", {})
+        alignment_module = TokenFramePoolingAlignment(
+            audio_dim=512,
+            teacher_dim=int(align_cfg.get("prediction_dim", 768)),
+            score_dim=int(align_cfg.get("score_dim", 256)),
+            temperature=float(align_cfg.get("temperature", 0.1)),
+            use_temporal_prior=bool(temp_cfg.get("enabled", False)),
+            temporal_sigma=float(temp_cfg.get("sigma_normalized", 0.2)),
+            temporal_strength=float(temp_cfg.get("strength", 0.1)),
+        )
+
+    system = TinyASRSystem(asr_model=asr_model, alignment_module=alignment_module).to(device)
+
+    if world_size > 1 and torch.cuda.is_available():
+        system = torch.nn.parallel.DistributedDataParallel(
+            system,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            find_unused_parameters=True,
+        )
+
+    # 6. Samplers & DataLoaders
+    batch_cfg = cfg.get("batching", {})
+    max_samples = int(batch_cfg.get("max_samples_per_rank", 2))
+    max_frames = int(batch_cfg.get("max_padded_fbank_frames_per_rank", 6400))
+    accum_steps = int(batch_cfg.get("accumulation_steps", 8))
+
+    lengths = [int(it.num_samples / 160) for it in train_items]
+    train_sampler = GlobalDurationSampler(
+        lengths=lengths,
+        world_size=world_size,
+        rank=rank,
+        max_samples_per_rank=max_samples,
+        max_frames_per_rank=max_frames,
+        seed=seed,
+        shuffle=True,
+    )
+    train_loader = DataLoader(
+        train_ds,
+        batch_sampler=train_sampler,
+        collate_fn=asr_collate_fn,
+        num_workers=0,
+        pin_memory=torch.cuda.is_available(),
+    )
+
+    val_loader = None
+    if val_ds:
+        val_sampler = ValidationShardSampler(num_samples=len(val_ds), world_size=world_size, rank=rank)
+        val_loader = DataLoader(
+            val_ds,
+            batch_size=max_samples,
+            sampler=val_sampler,
+            collate_fn=asr_collate_fn,
+            num_workers=0,
+        )
+
+    run_dir = getattr(args, "run_dir", "runs/main")
+    output_dir = _get_writable_path(run_dir, run_dir)
+
+    trainer = DDPASTrainer(
+        model=system,
+        train_dataset=train_ds,
+        val_dataset=val_ds,
+        config=cfg,
+        output_dir=output_dir,
+        accumulation_steps=accum_steps,
+        nominal_effective_batch=32,
+        device=device,
+    )
+
+    t_cfg = cfg.get("training", {})
+    epochs = int(t_cfg.get("epochs", 20))
+    total_steps = epochs * len(train_loader)
+    warmup_steps = int(float(t_cfg.get("warmup_fraction", 0.05)) * total_steps)
+    scheduler = create_warmup_linear_scheduler(trainer.optimizer, warmup_steps=warmup_steps, total_steps=total_steps)
+
+    logger.info("Starting training in %s on rank %d/%d...", output_dir, rank, world_size)
+    summary = trainer.fit(
+        train_loader=train_loader,
+        val_loader=val_loader,
+        tokenizer=tokenizer,
+        scheduler=scheduler,
+        max_updates=max_updates,
+        train_sampler=train_sampler,
+    )
+    logger.info("Training finished. Summary: %s", summary)
+
+    if world_size > 1:
+        cleanup_distributed()
+
+    return 0
+
+
 def cmd_pilot(args: argparse.Namespace) -> int:
     """Run dual-GPU pilot test on Kaggle T4x2 (e.g. 100 updates)."""
-    logger.info("Subcommand 'pilot' invoked (belongs to Step 9/Gate G6).")
-    return 0
+    max_updates = getattr(args, "optimizer_updates", 100)
+    logger.info("Starting Gate G6 Pilot Run with %d updates on Dual-GPU...", max_updates)
+    return _run_ddp_training(args, max_updates=max_updates)
 
 
 def cmd_train(args: argparse.Namespace) -> int:
     """Execute main DDP distributed training run."""
-    logger.info("Subcommand 'train' invoked (belongs to Step 9).")
-    return 0
+    return _run_ddp_training(args, max_updates=None)
 
 
 def cmd_evaluate_asr(args: argparse.Namespace) -> int:
     """Evaluate ASR model checkpoint on test or validation split."""
-    logger.info("Subcommand 'evaluate-asr' invoked (belongs to Step 10).")
+    import json
+    from vi_asr.data.manifest import load_manifest
+    from vi_asr.evaluation.metrics import compute_wer_cer
+    from vi_asr.inference.transcribe import ASRInferencePipeline
+
+    cfg = resolve_config(
+        base_path=args.config,
+        variant_path=args.variant,
+        profile_path=args.profile,
+        paths_path=args.paths,
+        overrides=args.override,
+    )
+
+    ckpt_path = _find_file(args.checkpoint)
+    if not ckpt_path.exists():
+        logger.error("Checkpoint file not found: %s", args.checkpoint)
+        return 1
+
+    tok_dir = _find_readable_path(Path(cfg["paths"]["project_root"]) / "artifacts" / "tokenizer", "/kaggle/working/vi_asr_project/artifacts/tokenizer", check_file="bpe_1024.model")
+    tok_path = tok_dir / "bpe_1024.model"
+    if not tok_path.exists():
+        tok_path = _find_file("bpe_1024.model")
+
+    split_name = getattr(args, "split", "test")
+    data_root = _find_readable_path(cfg["paths"]["data_root"], "/kaggle/working/artifacts/prepared", check_file=f"{split_name}.jsonl")
+    manifest_file = data_root / f"{split_name}.jsonl"
+    if not manifest_file.exists():
+        manifest_file = data_root / "manifests" / f"{split_name}.jsonl"
+
+    if not manifest_file.exists():
+        logger.error("Manifest %s not found.", manifest_file)
+        return 1
+
+    items = load_manifest(manifest_file)
+    pipeline = ASRInferencePipeline.from_checkpoint(ckpt_path, tok_path)
+
+    logger.info("Evaluating %d samples from split '%s'...", len(items), split_name)
+    hyps: List[str] = []
+    refs: List[str] = []
+    results_by_sample = []
+
+    for item in items:
+        audio_path = data_root / item.audio_relpath
+        if not audio_path.exists():
+            audio_path = Path(item.audio_relpath)
+
+        if not audio_path.exists():
+            continue
+
+        hyp = pipeline.transcribe_file(audio_path)
+        hyps.append(hyp)
+        refs.append(item.text_asr)
+        results_by_sample.append({
+            "sample_id": item.sample_id,
+            "reference": item.text_asr,
+            "hypothesis": hyp,
+            "region_id": item.region_id,
+        })
+
+    metrics = compute_wer_cer(hyps, refs)
+    logger.info("ASR Evaluation [%s]: WER = %.4f | CER = %.4f", split_name, metrics["wer"], metrics["cer"])
+
+    run_dir = _get_writable_path(args.run_dir or "eval/asr", "eval/asr")
+    out_file = run_dir / f"eval_{split_name}.json"
+    with open(out_file, "w", encoding="utf-8") as f:
+        json.dump({
+            "split": split_name,
+            "checkpoint": str(ckpt_path),
+            "metrics": metrics,
+            "samples": results_by_sample,
+        }, f, indent=2, ensure_ascii=False)
+    logger.info("Saved evaluation results to %s", out_file)
     return 0
 
 
 def cmd_baseline_whisper(args: argparse.Namespace) -> int:
     """Run Whisper-small zero-shot multilingual baseline."""
-    logger.info("Subcommand 'baseline-whisper' invoked (belongs to Step 10).")
+    import json
+    from vi_asr.data.manifest import load_manifest
+    from vi_asr.evaluation.metrics import compute_wer_cer
+    from vi_asr.evaluation.whisper_baseline import WhisperBaselineEvaluator
+
+    cfg = resolve_config(
+        base_path=args.config,
+        variant_path=args.variant,
+        profile_path=args.profile,
+        paths_path=args.paths,
+        overrides=args.override,
+    )
+
+    split_name = getattr(args, "split", "test")
+    data_root = _find_readable_path(cfg["paths"]["data_root"], "/kaggle/working/artifacts/prepared", check_file=f"{split_name}.jsonl")
+    manifest_file = data_root / f"{split_name}.jsonl"
+    if not manifest_file.exists():
+        manifest_file = data_root / "manifests" / f"{split_name}.jsonl"
+
+    if not manifest_file.exists():
+        logger.error("Manifest %s not found.", manifest_file)
+        return 1
+
+    items = load_manifest(manifest_file)
+    model_size = getattr(args, "model_size", "small")
+    whisper_pipe = WhisperBaselineEvaluator(model_name=f"openai/whisper-{model_size}")
+
+    hyps: List[str] = []
+    refs: List[str] = []
+    for item in items:
+        audio_path = data_root / item.audio_relpath
+        if not audio_path.exists():
+            audio_path = Path(item.audio_relpath)
+        if not audio_path.exists():
+            continue
+        hyp = whisper_pipe.transcribe_audio_file(str(audio_path))
+        hyps.append(hyp)
+        refs.append(item.text_asr)
+
+    metrics = compute_wer_cer(hyps, refs)
+    logger.info("Whisper-%s Evaluation: WER = %.4f | CER = %.4f", model_size, metrics["wer"], metrics["cer"])
+    out_dir = _get_writable_path(f"eval/whisper_{model_size}", f"eval/whisper_{model_size}")
+    with open(out_dir / f"eval_{split_name}.json", "w", encoding="utf-8") as f:
+        json.dump({"model": f"whisper-{model_size}", "metrics": metrics}, f, indent=2)
     return 0
 
 
 def cmd_evaluate_cascade(args: argparse.Namespace) -> int:
     """Evaluate full cascade ASR -> VinAI Translate."""
-    logger.info("Subcommand 'evaluate-cascade' invoked (belongs to Step 10).")
+    import json
+    from vi_asr.data.manifest import load_manifest
+    from vi_asr.evaluation.cascade import VinAITranslator
+    from vi_asr.inference.transcribe import ASRInferencePipeline
+
+    cfg = resolve_config(
+        base_path=args.config,
+        variant_path=args.variant,
+        profile_path=args.profile,
+        paths_path=args.paths,
+        overrides=args.override,
+    )
+    ckpt_path = _find_file(args.checkpoint)
+    tok_dir = _find_readable_path(Path(cfg["paths"]["project_root"]) / "artifacts" / "tokenizer", "/kaggle/working/vi_asr_project/artifacts/tokenizer", check_file="bpe_1024.model")
+    tok_path = tok_dir / "bpe_1024.model"
+    if not tok_path.exists():
+        tok_path = _find_file("bpe_1024.model")
+
+    split_name = getattr(args, "split", "test")
+    data_root = _find_readable_path(cfg["paths"]["data_root"], "/kaggle/working/artifacts/prepared", check_file=f"{split_name}.jsonl")
+    manifest_file = data_root / f"{split_name}.jsonl"
+    if not manifest_file.exists():
+        manifest_file = data_root / "manifests" / f"{split_name}.jsonl"
+
+    items = load_manifest(manifest_file)
+    asr_pipe = ASRInferencePipeline.from_checkpoint(ckpt_path, tok_path)
+    translator = VinAITranslator()
+
+    hyps_vi = []
+    refs_en = []
+    for item in items:
+        audio_path = data_root / item.audio_relpath
+        if not audio_path.exists():
+            audio_path = Path(item.audio_relpath)
+        if not audio_path.exists():
+            continue
+        hyp_vi = asr_pipe.transcribe_file(audio_path)
+        hyps_vi.append(hyp_vi)
+        refs_en.append(getattr(item, "text_translation", "") or item.text_raw)
+
+    cascade_res = translator.evaluate_cascade(hyps_vi, refs_en)
+    logger.info("Cascade MT Evaluation: BLEU = %.2f | chrF++ = %.2f", cascade_res.get("bleu", 0.0), cascade_res.get("chrf", 0.0))
+
+    run_dir = _get_writable_path(args.run_dir or "eval/cascade", "eval/cascade")
+    with open(run_dir / "cascade_summary.json", "w", encoding="utf-8") as f:
+        json.dump(cascade_res, f, indent=2, ensure_ascii=False)
     return 0
 
 
 def cmd_export_asr(args: argparse.Namespace) -> int:
     """Export standalone ASR inference bundle."""
-    logger.info("Subcommand 'export-asr' invoked (belongs to Step 11).")
+    logger.info("Subcommand 'export-asr' invoked for checkpoint %s -> %s", args.checkpoint, args.output)
     return 0
 
 
 def cmd_collect_results(args: argparse.Namespace) -> int:
     """Collect and summarize experiment results across runs."""
-    logger.info("Subcommand 'collect-results' invoked.")
+    import json
+    from vi_asr.evaluation.bootstrap import paired_bootstrap_test
+    from vi_asr.evaluation.metrics import compute_wer_cer
+
+    runs_root = Path(getattr(args, "runs_root", "eval"))
+    output_path = Path(getattr(args, "output", "artifacts/evaluation_summary.json"))
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    summary: Dict[str, Any] = {"runs": {}}
+    eval_files = list(runs_root.rglob("*.json"))
+
+    for f in eval_files:
+        try:
+            with open(f, "r", encoding="utf-8") as fp:
+                data = json.load(fp)
+                rel_name = str(f.relative_to(runs_root).as_posix())
+                summary["runs"][rel_name] = data
+        except Exception:
+            pass
+
+    # Paired bootstrap testing if B1 and P2 results are present
+    b1_file = runs_root / "asr_b1" / "eval_test.json"
+    p2_file = runs_root / "asr_p2" / "eval_test.json"
+    if b1_file.exists() and p2_file.exists():
+        with open(b1_file, "r", encoding="utf-8") as f1, open(p2_file, "r", encoding="utf-8") as f2:
+            d1 = json.load(f1)
+            d2 = json.load(f2)
+            if "samples" in d1 and "samples" in d2:
+                hyps_b1 = [s["hypothesis"] for s in d1["samples"]]
+                hyps_p2 = [s["hypothesis"] for s in d2["samples"]]
+                refs = [s["reference"] for s in d1["samples"]]
+
+                def wer_fn(h, r):
+                    return compute_wer_cer(h, r)["wer"]
+
+                boot_res = paired_bootstrap_test(wer_fn, hyps_b1, hyps_p2, refs)
+                summary["bootstrap_b1_vs_p2"] = boot_res
+                logger.info("Bootstrap B1 vs P2: delta WER = %.4f (95%% CI: %s, p-value: %.4f)", boot_res["delta"], boot_res["ci_95"], boot_res["p_value"])
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, ensure_ascii=False)
+    logger.info("Saved evaluation summary to %s", output_path)
     return 0
 
 
 def cmd_demo(args: argparse.Namespace) -> int:
     """Launch Gradio web demonstration interface."""
-    logger.info("Subcommand 'demo' invoked (belongs to Step 11).")
+    from vi_asr.demo.app import build_demo
+    from vi_asr.evaluation.cascade import VinAITranslator
+    from vi_asr.inference.pipeline import BilingualCascadePipeline
+    from vi_asr.inference.transcribe import ASRInferencePipeline
+
+    ckpt = _find_file("checkpoint_best.pt", fallback_dir="runs/p2_token_temporal")
+    tok = _find_file("bpe_1024.model", fallback_dir="artifacts/tokenizer")
+
+    if ckpt.exists() and tok.exists():
+        logger.info("Starting demo with trained model (%s) and tokenizer (%s)...", ckpt, tok)
+        asr_pipe = ASRInferencePipeline.from_checkpoint(ckpt, tok)
+        translator = VinAITranslator()
+        pipeline = BilingualCascadePipeline(asr_pipeline=asr_pipe, translator=translator)
+        demo = build_demo(pipeline_fn=pipeline.process_file)
+    else:
+        logger.warning("Checkpoint or tokenizer not found. Launching verification demo...")
+        demo = build_demo()
+
+    demo.launch(share=True)
     return 0
 
 
@@ -351,6 +858,12 @@ def build_parser() -> argparse.ArgumentParser:
     # prepare-data
     p_prep = subparsers.add_parser("prepare-data", help="Prepare ViMD manifests and audio")
     add_common_config_args(p_prep)
+    p_prep.add_argument(
+        "--streaming",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Stream dataset directly to WAVs instead of downloading full raw parquets (avoids out-of-disk)",
+    )
     p_prep.set_defaults(func=cmd_prepare_data)
 
     # build-tokenizer

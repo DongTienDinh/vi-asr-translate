@@ -7,6 +7,7 @@ experiment:
 data:
   hf_id: nguyendv02/ViMD_Dataset
   revision: 3a5b30157034e7eadd5c75fae1a820c6f9383398
+  streaming: true
   split_mapping: audited
   local_audio: true
   allow_random_audio_crop: false

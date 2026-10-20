@@ -105,7 +105,13 @@ def prepare_manifests_from_hf(
 
         canonical_split = "valid" if actual_split_key in ["validation", "valid", "dev"] else actual_split_key
         ds = dataset_dict[actual_split_key]
-        logger.info(f"Processing split {actual_split_key} ({len(ds)} items) -> {canonical_split}.jsonl")
+        manifests_dir = out_p / "manifests"
+        manifests_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            count_str = f"({len(ds)} items)"
+        except (TypeError, AttributeError):
+            count_str = "(streaming mode)"
+        logger.info(f"Processing split {actual_split_key} {count_str} -> {canonical_split}.jsonl")
 
         items: List[ManifestItem] = []
         for idx, sample in enumerate(ds):
@@ -114,10 +120,14 @@ def prepare_manifests_from_hf(
             )
             if item is not None:
                 items.append(item)
+            if (idx + 1) % 500 == 0:
+                logger.info(f"[{canonical_split}] Processed {idx + 1} samples (collected {len(items)} items)...")
 
         dest_file = out_p / f"{canonical_split}.jsonl"
         save_manifest(items, dest_file)
+        # Also mirror into manifests/ subdirectory for nested path loaders
+        save_manifest(items, manifests_dir / f"{canonical_split}.jsonl")
         manifest_paths[canonical_split] = dest_file
-        logger.info(f"Saved {len(items)} manifest items to {dest_file}")
+        logger.info(f"Saved {len(items)} manifest items to {dest_file} and {manifests_dir / f'{canonical_split}.jsonl'}")
 
     return manifest_paths

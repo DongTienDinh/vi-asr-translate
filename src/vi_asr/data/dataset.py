@@ -86,6 +86,7 @@ class ASRDataset(Dataset):
             "feat_length": feats.size(0),
             "targets": target_tensor,  # [U]
             "target_length": len(target_ids),
+            "text_asr": item.text_asr,
         }
 
         # 5. Load teacher states from offline cache if available (P1/P2 variants)

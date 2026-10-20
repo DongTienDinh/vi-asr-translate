@@ -49,6 +49,7 @@ def asr_collate_fn(batch_items: List[Dict[str, Any]]) -> Dict[str, Any]:
         "feat_lengths": feat_lengths,
         "ctc_targets": padded_targets,
         "target_lengths": target_lengths,
+        "transcripts": [item.get("text_asr", "") for item in batch_items],
     }
 
     # Optional teacher states

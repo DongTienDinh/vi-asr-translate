@@ -1,15 +1,44 @@
-"""Update notebook cells to safely cd to /kaggle/working and set writable HF cache dirs."""
+"""Update notebook cells to safely cd to /kaggle/working, set writable HF cache dirs, and auto-discover files."""
 
 import json
 from pathlib import Path
 
-ENV_CELL_SNIPPET = [
-    "# Cấu hình thư mục cache Hugging Face ghi vào /tmp để không bị lỗi Read-only /root/.cache\n",
-    "%env HF_HOME=/tmp/huggingface\n",
-    "%env HF_DATASETS_CACHE=/tmp/huggingface/datasets\n",
-    "%env TRANSFORMERS_CACHE=/tmp/huggingface/hub\n",
-    "%env TORCH_HOME=/tmp/torch\n",
+COMMON_INIT_SNIPPET = [
+    "%cd /kaggle/working\n",
+    "# Cấu hình thư mục cache ghi vào /kaggle/working/.cache để không làm đầy phân vùng root /tmp (~5GB)\n",
+    "%env HF_HOME=/kaggle/working/.cache/huggingface\n",
+    "%env HF_DATASETS_CACHE=/kaggle/working/.cache/huggingface/datasets\n",
+    "%env TRANSFORMERS_CACHE=/kaggle/working/.cache/huggingface/hub\n",
+    "%env TORCH_HOME=/kaggle/working/.cache/torch\n",
     "%env PYTHONPATH=/kaggle/working/vi_asr_project/src\n",
+    "import os, sys, zipfile\n",
+    "from pathlib import Path\n",
+    "\n",
+    "work_dir = Path(\"/kaggle/working/vi_asr_project\")\n",
+    "zip_source = Path(\"/kaggle/input/vi-asr-code/vi_asr_project.zip\")\n",
+    "if not zip_source.exists():\n",
+    "    zip_source = Path(\"vi_asr_project.zip\")\n",
+    "\n",
+    "if not (work_dir / \"pyproject.toml\").exists():\n",
+    "    if zip_source.exists():\n",
+    "        with zipfile.ZipFile(zip_source, 'r') as zf:\n",
+    "            zf.extractall(\"/kaggle/working\")\n",
+    "        print(\"Unpacked vi_asr_project from zip successfully.\")\n",
+    "    else:\n",
+    "        print(\"Cloning repository from GitHub...\")\n",
+    "        !rm -rf /kaggle/working/vi_asr_project\n",
+    "        !git clone --recurse-submodules https://github.com/DongTienDinh/vi-asr-translate.git /kaggle/working/vi_asr_project\n",
+    "\n",
+    "%cd /kaggle/working/vi_asr_project\n",
+    "!pip install -q -r requirements-kaggle.in\n",
+    "!pip install -q -e .\n",
+    "\n",
+    "src_dir = str(work_dir / \"src\")\n",
+    "if src_dir not in sys.path:\n",
+    "    sys.path.insert(0, src_dir)\n",
+    "\n",
+    "import vi_asr\n",
+    "print('vi_asr successfully loaded from:', vi_asr.__file__)\n",
 ]
 
 def patch_01():
@@ -18,39 +47,11 @@ def patch_01():
         nb = json.load(f)
     
     nb["cells"][2]["source"] = [
-        "# 2. Nạp mã nguồn vi_asr_project (từ Zip hoặc Git Clone trực tiếp)\n",
-        "%cd /kaggle/working\n",
-        *ENV_CELL_SNIPPET,
-        "import os, sys, zipfile\n",
-        "from pathlib import Path\n",
-        "\n",
-        "work_dir = Path(\"/kaggle/working/vi_asr_project\")\n",
-        "zip_source = Path(\"/kaggle/input/vi-asr-code/vi_asr_project.zip\")\n",
-        "if not zip_source.exists():\n",
-        "    zip_source = Path(\"vi_asr_project.zip\")\n",
-        "\n",
-        "if zip_source.exists():\n",
-        "    with zipfile.ZipFile(zip_source, 'r') as zf:\n",
-        "        zf.extractall(\"/kaggle/working\")\n",
-        "    print(\"Unpacked vi_asr_project from zip successfully.\")\n",
-        "else:\n",
-        "    print(\"Cloning latest repository directly from GitHub...\")\n",
-        "    !rm -rf /kaggle/working/vi_asr_project\n",
-        "    !git clone --recurse-submodules https://github.com/DongTienDinh/vi-asr-translate.git /kaggle/working/vi_asr_project\n",
-        "\n",
-        "# Thêm thư mục src vào sys.path của Kernel hiện tại\n",
-        "src_dir = str(work_dir / \"src\")\n",
-        "if src_dir not in sys.path:\n",
-        "    sys.path.insert(0, src_dir)\n",
-        "\n",
-        "# Cài đặt package vi-asr ở chế độ editable\n",
-        "%cd /kaggle/working/vi_asr_project\n",
-        "!pip install -q -e .\n",
-        "import vi_asr\n",
-        "print('vi_asr successfully installed and loaded from:', vi_asr.__file__)\n"
+        "# 2. Nạp mã nguồn vi_asr_project (từ Zip hoặc Git Clone) & Cài đặt dependencies\n",
+        *COMMON_INIT_SNIPPET,
     ]
     nb["cells"][3]["source"] = [
-        "# 3. Chuẩn bị manifests dữ liệu từ Hugging Face\n",
+        "# 3. Chuẩn bị manifests dữ liệu từ Hugging Face (mặc định streaming để tránh tràn đĩa)\n",
         "!python -m vi_asr prepare-data \\\n",
         "    --config configs/base.yaml \\\n",
         "    --paths configs/paths/kaggle_prepare.yaml\n"
@@ -87,24 +88,7 @@ def patch_02():
     
     nb["cells"][2]["source"] = [
         "# 2. Chuyển vào thư mục dự án và kiểm tra CLI\n",
-        "%cd /kaggle/working\n",
-        *ENV_CELL_SNIPPET,
-        "import sys\n",
-        "from pathlib import Path\n",
-        "\n",
-        "work_dir = Path(\"/kaggle/working/vi_asr_project\")\n",
-        "if not (work_dir / \"pyproject.toml\").exists():\n",
-        "    !rm -rf /kaggle/working/vi_asr_project\n",
-        "    !git clone --recurse-submodules https://github.com/DongTienDinh/vi-asr-translate.git /kaggle/working/vi_asr_project\n",
-        "    %cd /kaggle/working/vi_asr_project\n",
-        "    !pip install -q -e .\n",
-        "else:\n",
-        "    %cd /kaggle/working/vi_asr_project\n",
-        "\n",
-        "src_dir = str(work_dir / \"src\")\n",
-        "if src_dir not in sys.path:\n",
-        "    sys.path.insert(0, src_dir)\n",
-        "\n",
+        *COMMON_INIT_SNIPPET,
         "!python -m vi_asr --help\n"
     ]
     with open(p, "w", encoding="utf-8") as f:
@@ -118,25 +102,8 @@ def patch_03():
     
     nb["cells"][1]["source"] = [
         "# Kiểm tra mã nguồn dự án và thiết bị\n",
-        "%cd /kaggle/working\n",
-        *ENV_CELL_SNIPPET,
-        "import sys\n",
-        "from pathlib import Path\n",
+        *COMMON_INIT_SNIPPET,
         "import torch\n",
-        "\n",
-        "work_dir = Path(\"/kaggle/working/vi_asr_project\")\n",
-        "if not (work_dir / \"pyproject.toml\").exists():\n",
-        "    !rm -rf /kaggle/working/vi_asr_project\n",
-        "    !git clone --recurse-submodules https://github.com/DongTienDinh/vi-asr-translate.git /kaggle/working/vi_asr_project\n",
-        "    %cd /kaggle/working/vi_asr_project\n",
-        "    !pip install -q -e .\n",
-        "else:\n",
-        "    %cd /kaggle/working/vi_asr_project\n",
-        "\n",
-        "src_dir = str(work_dir / \"src\")\n",
-        "if src_dir not in sys.path:\n",
-        "    sys.path.insert(0, src_dir)\n",
-        "\n",
         "print(\"Ready for evaluation on device:\", torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"CPU\")\n"
     ]
     with open(p, "w", encoding="utf-8") as f:
@@ -150,22 +117,36 @@ def patch_04():
     
     nb["cells"][1]["source"] = [
         "# Chuẩn bị mã nguồn dự án và cài đặt dependencies cho Web UI\n",
-        "%cd /kaggle/working\n",
-        *ENV_CELL_SNIPPET,
-        "import sys\n",
+        *COMMON_INIT_SNIPPET,
+        "!pip install -q gradio soundfile\n",
+    ]
+    nb["cells"][2]["source"] = [
+        "# Khởi chạy Demo Web UI\n",
+        "from vi_asr.demo.app import build_demo\n",
+        "from vi_asr.inference.pipeline import BilingualCascadePipeline\n",
+        "from vi_asr.inference.transcribe import ASRInferencePipeline\n",
+        "from vi_asr.evaluation.cascade import VinAITranslator\n",
+        "from vi_asr.cli import _find_file\n",
         "from pathlib import Path\n",
         "\n",
-        "work_dir = Path(\"/kaggle/working/vi_asr_project\")\n",
-        "if not (work_dir / \"pyproject.toml\").exists():\n",
-        "    !rm -rf /kaggle/working/vi_asr_project\n",
-        "    !git clone --recurse-submodules https://github.com/DongTienDinh/vi-asr-translate.git /kaggle/working/vi_asr_project\n",
+        "# Tự động tìm kiếm checkpoint và tokenizer\n",
+        "ckpt_path = _find_file(\"checkpoint_best.pt\", fallback_dir=\"runs/p2_token_temporal\")\n",
+        "tok_path = _find_file(\"bpe_1024.model\", fallback_dir=\"artifacts/tokenizer\")\n",
         "\n",
-        "%cd /kaggle/working/vi_asr_project\n",
-        "!pip install -q -e .\n",
-        "!pip install -q gradio soundfile\n",
-        "src_dir = str(work_dir / \"src\")\n",
-        "if src_dir not in sys.path:\n",
-        "    sys.path.insert(0, src_dir)\n"
+        "print(f\"Checkpoint location: {ckpt_path} (exists: {ckpt_path.exists()})\")\n",
+        "print(f\"Tokenizer location:  {tok_path} (exists: {tok_path.exists()})\")\n",
+        "\n",
+        "if ckpt_path.exists() and tok_path.exists():\n",
+        "    print(\"Loading trained ASR model and VinAI translator...\")\n",
+        "    asr_pipe = ASRInferencePipeline.from_checkpoint(ckpt_path, tok_path)\n",
+        "    translator = VinAITranslator()\n",
+        "    pipeline = BilingualCascadePipeline(asr_pipeline=asr_pipe, translator=translator)\n",
+        "    demo = build_demo(pipeline_fn=pipeline.process_file)\n",
+        "else:\n",
+        "    print(\"Checkpoint not found. Running demo in interactive verification mode...\")\n",
+        "    demo = build_demo()\n",
+        "\n",
+        "demo.launch(share=True, debug=True)\n"
     ]
     with open(p, "w", encoding="utf-8") as f:
         json.dump(nb, f, indent=1, ensure_ascii=False)

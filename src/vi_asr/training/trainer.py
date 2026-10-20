@@ -123,8 +123,15 @@ class DDPASTrainer:
 
         self.optimizer = AdamW(params)
         self.epochs = int(train_cfg.get("epochs", 20))
+        self.global_updates = 0
 
-    def train_epoch(self, epoch: int, train_loader: DataLoader, scheduler: Optional[Any] = None) -> float:
+    def train_epoch(
+        self,
+        epoch: int,
+        train_loader: DataLoader,
+        scheduler: Optional[Any] = None,
+        max_updates: Optional[int] = None,
+    ) -> float:
         self.model.train()
         total_loss = 0.0
         microstep_count = 0
@@ -212,9 +219,135 @@ class DDPASTrainer:
                 self.optimizer.zero_grad()
                 accum_samples_local = 0
                 optimizer_updates += 1
+                self.global_updates += 1
+
+                if max_updates is not None and self.global_updates >= max_updates:
+                    break
 
         avg_loss = total_loss / max(1, microstep_count)
         return avg_loss
+
+    @torch.no_grad()
+    def evaluate(self, val_loader: DataLoader, tokenizer: Optional[Any] = None) -> Dict[str, Any]:
+        """Evaluate validation set, compute loss and optional WER/CER."""
+        raw_m = self.model.module if hasattr(self.model, "module") else self.model
+        self.model.eval()
+        total_val_loss = 0.0
+        steps = 0
+        all_hyps: List[str] = []
+        all_refs: List[str] = []
+
+        for batch in val_loader:
+            for k in ("feats", "feat_lengths", "ctc_targets", "target_lengths", "teacher_states", "teacher_lengths"):
+                if k in batch and isinstance(batch[k], torch.Tensor):
+                    batch[k] = batch[k].to(self.device)
+
+            out = self.model(batch)
+            loss_dict = self.loss_fn(
+                ctc_logits=out["logits"],
+                ctc_output_lengths=out["output_lengths"],
+                ctc_targets=batch["ctc_targets"],
+                ctc_target_lengths=batch["target_lengths"],
+                predicted_teacher=out.get("predicted_teacher"),
+                target_teacher=batch.get("teacher_states"),
+                token_lengths=batch.get("teacher_lengths"),
+            )
+            total_val_loss += loss_dict["loss"].item()
+            steps += 1
+
+            if tokenizer is not None:
+                asr_net = raw_m.asr_model if hasattr(raw_m, "asr_model") else raw_m
+                if hasattr(asr_net, "transcribe"):
+                    hyp_ids = asr_net.transcribe(batch["feats"], batch["feat_lengths"])
+                else:
+                    logits = out["logits"]
+                    preds = torch.argmax(logits, dim=-1)
+                    hyp_ids = [preds[i, : int(out["output_lengths"][i])].tolist() for i in range(preds.size(0))]
+
+                refs = batch.get("transcripts") or []
+                for h_ids, ref_str in zip(hyp_ids, refs):
+                    all_hyps.append(tokenizer.decode(h_ids) if hasattr(tokenizer, "decode") else "")
+                    all_refs.append(str(ref_str))
+
+        avg_loss = total_val_loss / max(1, steps)
+        metrics: Dict[str, Any] = {"val_loss": avg_loss}
+
+        if all_hyps and all_refs:
+            from vi_asr.evaluation.metrics import compute_wer_cer
+            wer_cer = compute_wer_cer(all_hyps, all_refs)
+            metrics["wer"] = wer_cer["wer"]
+            metrics["cer"] = wer_cer["cer"]
+        else:
+            metrics["wer"] = 1.0
+            metrics["cer"] = 1.0
+
+        return metrics
+
+    def fit(
+        self,
+        train_loader: DataLoader,
+        val_loader: Optional[DataLoader] = None,
+        tokenizer: Optional[Any] = None,
+        scheduler: Optional[Any] = None,
+        max_updates: Optional[int] = None,
+        train_sampler: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        """Run complete training loop across epochs or until max_updates."""
+        best_wer = float("inf")
+        best_loss = float("inf")
+        best_epoch = 0
+
+        for epoch in range(1, self.epochs + 1):
+            if train_sampler is not None and hasattr(train_sampler, "set_epoch"):
+                train_sampler.set_epoch(epoch)
+
+            logger.info("Epoch %d/%d starting...", epoch, self.epochs)
+            train_loss = self.train_epoch(epoch, train_loader, scheduler, max_updates=max_updates)
+            logger.info("Epoch %d/%d completed. Avg Train Loss: %.4f", epoch, self.epochs, train_loss)
+
+            val_metrics: Dict[str, Any] = {}
+            if val_loader is not None:
+                val_metrics = self.evaluate(val_loader, tokenizer=tokenizer)
+                logger.info(
+                    "Epoch %d Validation: Loss: %.4f | WER: %.4f | CER: %.4f",
+                    epoch,
+                    val_metrics["val_loss"],
+                    val_metrics.get("wer", 1.0),
+                    val_metrics.get("cer", 1.0),
+                )
+
+            current_metric = val_metrics.get("wer", train_loss)
+            is_best = current_metric < best_wer
+            if is_best:
+                best_wer = current_metric
+                best_loss = val_metrics.get("val_loss", train_loss)
+                best_epoch = epoch
+
+            if is_main_process():
+                save_training_checkpoint(
+                    checkpoint_dir=self.output_dir,
+                    epoch=epoch,
+                    global_step=self.global_updates,
+                    model=self.model,
+                    optimizer=self.optimizer,
+                    scaler=self.scaler,
+                    scheduler=scheduler,
+                    metrics={"train_loss": train_loss, **val_metrics},
+                    config=self.config,
+                    is_best=is_best,
+                )
+
+            if max_updates is not None and self.global_updates >= max_updates:
+                logger.info("Reached max_updates (%d). Stopping training.", max_updates)
+                break
+
+        return {
+            "best_wer": best_wer,
+            "best_loss": best_loss,
+            "best_epoch": best_epoch,
+            "checkpoint_best": str(self.output_dir / "checkpoint_best.pt"),
+            "checkpoint_latest": str(self.output_dir / "checkpoint_latest.pt"),
+        }
 
 
 class nullcontext:
