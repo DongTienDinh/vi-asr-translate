@@ -51,7 +51,8 @@ class GlobalDurationSampler(Sampler[List[int]]):
         """Set epoch for deterministic permutation across epochs."""
         self.epoch = epoch
 
-    def __iter__(self) -> Iterator[List[int]]:
+    def _global_microbatches(self) -> List[List[int]]:
+        """Build the same complete global microbatch list on every rank."""
         rng = random.Random(self.seed + self.epoch)
 
         # 1. Bucket and sort by length with randomized intra-bucket perturbation
@@ -100,7 +101,13 @@ class GlobalDurationSampler(Sampler[List[int]]):
             )
             local_batches = local_batches[: num_complete_groups * self.world_size]
 
-        # 5. Yield batches for this specific rank
+        return local_batches
+
+    def __iter__(self) -> Iterator[List[int]]:
+        local_batches = self._global_microbatches()
+        num_complete_groups = len(local_batches) // self.world_size
+
+        # Yield batches for this specific rank
         # Group g has world_size batches: local_batches[g * R : (g + 1) * R]
         # Rank r takes batch at index: g * R + r
         for g in range(num_complete_groups):
@@ -109,8 +116,7 @@ class GlobalDurationSampler(Sampler[List[int]]):
                 yield local_batches[batch_idx]
 
     def __len__(self) -> int:
-        num_groups = len(self.lengths) // (self.max_samples_per_rank * self.world_size)
-        return max(1, num_groups)
+        return len(self._global_microbatches()) // self.world_size
 
 
 class ValidationShardSampler(Sampler[int]):

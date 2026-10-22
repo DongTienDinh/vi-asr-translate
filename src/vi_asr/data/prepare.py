@@ -5,6 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
+import numpy as np
+
 from vi_asr.data.manifest import REGION_NAME_TO_ID, ManifestItem, save_manifest
 from vi_asr.data.normalize import (
     compute_text_hash,
@@ -14,6 +16,58 @@ from vi_asr.data.normalize import (
 from vi_asr.utils.logging import setup_logger
 
 logger = setup_logger("vi_asr.data.prepare")
+
+
+def decode_audio_value(audio_value: Any) -> tuple[np.ndarray, int]:
+    """Decode legacy HF audio dictionaries or modern torchcodec AudioDecoder values.
+
+    Hugging Face Datasets 4.4+ yields an AudioDecoder whose ``get_all_samples``
+    result stores data as ``[channels, samples]``. Older releases yield a
+    dictionary with ``array`` and ``sampling_rate``. This adapter normalizes both
+    contracts to one mono float32 waveform ``[samples]``.
+    """
+    audio_array: Any = None
+    sample_rate: Any = None
+
+    if isinstance(audio_value, dict):
+        audio_array = audio_value.get("array")
+        sample_rate = audio_value.get("sampling_rate")
+        if audio_array is None and audio_value.get("path"):
+            import soundfile as sf
+
+            audio_array, sample_rate = sf.read(str(audio_value["path"]), dtype="float32")
+    elif hasattr(audio_value, "get_all_samples"):
+        decoded = audio_value.get_all_samples()
+        audio_array = decoded.data
+        sample_rate = decoded.sample_rate
+    elif isinstance(audio_value, (str, Path)):
+        import soundfile as sf
+
+        audio_array, sample_rate = sf.read(str(audio_value), dtype="float32")
+
+    if audio_array is None or sample_rate is None:
+        raise ValueError(f"Unsupported or empty audio value: {type(audio_value)!r}")
+
+    if hasattr(audio_array, "detach"):
+        audio_array = audio_array.detach().cpu().numpy()
+    waveform = np.asarray(audio_array, dtype=np.float32)
+
+    if waveform.ndim == 2:
+        # torchcodec: [channels, samples]; soundfile: [samples, channels].
+        if waveform.shape[0] <= 8 and waveform.shape[1] > waveform.shape[0]:
+            waveform = waveform.mean(axis=0)
+        elif waveform.shape[1] <= 8:
+            waveform = waveform.mean(axis=1)
+        else:
+            raise ValueError(f"Ambiguous 2-D audio shape: {waveform.shape}")
+    elif waveform.ndim != 1:
+        waveform = np.squeeze(waveform)
+        if waveform.ndim != 1:
+            raise ValueError(f"Expected mono/ multichannel audio, got shape {waveform.shape}")
+
+    if waveform.size == 0:
+        raise ValueError("Decoded audio is empty")
+    return np.ascontiguousarray(waveform, dtype=np.float32), int(sample_rate)
 
 
 def parse_sample_to_manifest_item(
@@ -41,32 +95,27 @@ def parse_sample_to_manifest_item(
     speaker_id = str(sample.get("speaker_id") or sample.get("speaker")) if sample.get("speaker_id") or sample.get("speaker") else None
 
     # Audio metadata
-    audio_info = sample.get("audio", {})
+    audio_info = sample.get("audio")
     audio_relpath = f"audio/{split}/{sample_id}.wav"
-    if isinstance(audio_info, dict):
-        sample_rate = int(audio_info.get("sampling_rate", 16000))
-        audio_array = audio_info.get("array")
-        existing_path = audio_info.get("path")
+    try:
+        audio_array, sample_rate = decode_audio_value(audio_info)
+    except Exception as decode_err:
+        logger.warning("Could not decode audio for sample %s: %s", sample_id, decode_err)
+        return None
 
-        # If output_dir is provided and audio_array is decoded in memory, write local wav file
-        if output_dir is not None and audio_array is not None:
-            dest_audio_path = Path(output_dir) / audio_relpath
-            if not dest_audio_path.exists():
-                dest_audio_path.parent.mkdir(parents=True, exist_ok=True)
-                import soundfile as sf
-                try:
-                    sf.write(str(dest_audio_path), audio_array, sample_rate, subtype="PCM_16")
-                except Exception as write_err:
-                    logger.warning("Could not write audio file %s: %s", dest_audio_path, write_err)
-                    return None
-        elif audio_array is None and not existing_path:
-            logger.warning("Sample %s has no audio array or path, skipping.", sample_id)
-            return None
+    if output_dir is not None:
+        dest_audio_path = Path(output_dir) / audio_relpath
+        if not dest_audio_path.exists():
+            dest_audio_path.parent.mkdir(parents=True, exist_ok=True)
+            import soundfile as sf
 
-        num_samples = len(audio_array) if audio_array is not None else int(sample.get("num_samples", 0))
-    else:
-        sample_rate = 16000
-        num_samples = int(sample.get("num_samples", 0))
+            try:
+                sf.write(str(dest_audio_path), audio_array, sample_rate, subtype="PCM_16")
+            except Exception as write_err:
+                logger.warning("Could not write audio file %s: %s", dest_audio_path, write_err)
+                return None
+
+    num_samples = int(audio_array.shape[0])
 
     duration = float(sample.get("duration", num_samples / sample_rate if sample_rate > 0 else 0.0))
 

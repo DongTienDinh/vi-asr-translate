@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import random
+import shutil
 from pathlib import Path
 from typing import Any, Dict, Optional, Union
 
@@ -50,6 +51,7 @@ def save_training_checkpoint(
     metrics: Optional[Dict[str, Any]] = None,
     config: Optional[Dict[str, Any]] = None,
     is_best: bool = False,
+    rng_states_by_rank: Optional[list[Dict[str, Any]]] = None,
 ) -> Path:
     """Save training checkpoint atomically using temporary file and atomic rename.
 
@@ -69,6 +71,7 @@ def save_training_checkpoint(
         "model_state_dict": raw_model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "rng_states": capture_rng_states(),
+        "rng_states_by_rank": rng_states_by_rank,
         "metrics": metrics or {},
         "config": config or {},
     }
@@ -79,23 +82,38 @@ def save_training_checkpoint(
     if scheduler is not None and hasattr(scheduler, "state_dict"):
         checkpoint_data["scheduler_state_dict"] = scheduler.state_dict()
 
-    final_path = ckpt_dir / f"checkpoint_epoch_{epoch:03d}.pt"
-    tmp_path = ckpt_dir / f"checkpoint_epoch_{epoch:03d}.pt.tmp"
-
-    torch.save(checkpoint_data, tmp_path)
-    os.replace(tmp_path, final_path)  # Atomic on POSIX and Windows
-
-    # Update latest symlink/copy
+    # Serialize exactly once.  The old latest remains valid if torch.save fails.
     latest_path = ckpt_dir / "checkpoint_latest.pt"
     tmp_latest = ckpt_dir / "checkpoint_latest.pt.tmp"
-    torch.save(checkpoint_data, tmp_latest)
-    os.replace(tmp_latest, latest_path)
+    try:
+        torch.save(checkpoint_data, tmp_latest)
+        os.replace(tmp_latest, latest_path)
+    finally:
+        if tmp_latest.exists():
+            tmp_latest.unlink()
+
+    def replace_link_or_copy(source: Path, destination: Path) -> None:
+        """Atomically point to one checkpoint inode; copy only if links are unavailable."""
+        temporary = destination.with_suffix(destination.suffix + ".link.tmp")
+        if temporary.exists():
+            temporary.unlink()
+        try:
+            os.link(source, temporary)
+        except OSError:
+            shutil.copy2(source, temporary)
+        os.replace(temporary, destination)
+
+    # Keep one human-readable epoch name, but prune older epoch snapshots.  On
+    # Kaggle/NTFS this is normally a hard link and consumes no duplicate space.
+    final_path = ckpt_dir / f"checkpoint_epoch_{epoch:03d}.pt"
+    replace_link_or_copy(latest_path, final_path)
+    for old_epoch in ckpt_dir.glob("checkpoint_epoch_*.pt"):
+        if old_epoch != final_path:
+            old_epoch.unlink()
 
     if is_best:
         best_path = ckpt_dir / "checkpoint_best.pt"
-        tmp_best = ckpt_dir / "checkpoint_best.pt.tmp"
-        torch.save(checkpoint_data, tmp_best)
-        os.replace(tmp_best, best_path)
+        replace_link_or_copy(latest_path, best_path)
 
     logger.info("Saved atomic checkpoint to %s (epoch %d, step %d)", final_path, epoch, global_step)
     return final_path
@@ -129,8 +147,17 @@ def load_training_checkpoint(
     if scheduler is not None and "scheduler_state_dict" in data and hasattr(scheduler, "load_state_dict"):
         scheduler.load_state_dict(data["scheduler_state_dict"])
 
-    if restore_rng and "rng_states" in data:
-        restore_rng_states(data["rng_states"])
+    if restore_rng:
+        rank_states = data.get("rng_states_by_rank")
+        if rank_states:
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            if rank >= len(rank_states):
+                raise RuntimeError(
+                    f"Checkpoint has RNG state for {len(rank_states)} ranks, cannot restore rank {rank}"
+                )
+            restore_rng_states(rank_states[rank])
+        elif "rng_states" in data:
+            restore_rng_states(data["rng_states"])
 
     logger.info("Resumed from checkpoint %s at epoch %d, step %d", ckpt_p, data.get("epoch", 0), data.get("global_step", 0))
     return data

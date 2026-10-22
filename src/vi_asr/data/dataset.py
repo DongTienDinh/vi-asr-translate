@@ -11,6 +11,7 @@ import torch
 from torch.utils.data import Dataset
 
 from vi_asr.data.augment import SpecAugment
+from vi_asr.data.audio_store import SHARD_INDEX_FILENAME, ShardedZipAudioReader
 from vi_asr.data.frontend import KaldiFrontend
 from vi_asr.data.manifest import ManifestItem
 from vi_asr.data.teacher_cache import TeacherCacheReader
@@ -41,6 +42,9 @@ class ASRDataset(Dataset):
         self.specaugment = specaugment
         self.teacher_reader = teacher_reader
         self.is_train = is_train
+        self.audio_store: Optional[ShardedZipAudioReader] = None
+        if self.audio_root and (self.audio_root / SHARD_INDEX_FILENAME).is_file():
+            self.audio_store = ShardedZipAudioReader(self.audio_root)
 
     def __len__(self) -> int:
         return len(self.items)
@@ -61,6 +65,14 @@ class ASRDataset(Dataset):
                 audio_path = c
                 break
 
+        if audio_path is None and self.audio_store is not None and item.audio_relpath:
+            wav_np, sample_rate = self.audio_store.read(item.audio_relpath)
+            if sample_rate != 16000:
+                raise RuntimeError(
+                    f"Prepared audio must be 16 kHz, got {sample_rate} for {item.sample_id}"
+                )
+            return torch.from_numpy(wav_np).unsqueeze(0)
+
         if audio_path is None and item.audio_relpath:
             fname = Path(item.audio_relpath).name
             kaggle_input = Path("/kaggle/input")
@@ -74,6 +86,8 @@ class ASRDataset(Dataset):
             raise FileNotFoundError(f"Audio file not found for sample {item.sample_id}: {item.audio_relpath}")
 
         wav_np, sr = sf.read(str(audio_path), dtype="float32")
+        if int(sr) != 16000:
+            raise RuntimeError(f"Prepared audio must be 16 kHz, got {sr} for {item.sample_id}")
         if wav_np.ndim > 1:
             wav_np = wav_np.mean(axis=1)  # mono
 
@@ -83,24 +97,8 @@ class ASRDataset(Dataset):
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         item = self.items[idx]
 
-        # 1. Load waveform with graceful fallback if individual audio file is missing
-        try:
-            waveform = self.load_waveform(item)
-        except FileNotFoundError as e:
-            logger.warning("Missing audio file for %s (%s). Attempting adjacent sample fallback.", item.sample_id, e)
-            waveform = None
-            for offset in range(1, min(50, len(self.items))):
-                alt_idx = (idx + offset) % len(self.items)
-                try:
-                    alt_item = self.items[alt_idx]
-                    waveform = self.load_waveform(alt_item)
-                    item = alt_item
-                    break
-                except FileNotFoundError:
-                    continue
-            if waveform is None:
-                logger.warning("No audio candidates found. Using 1.0s silence placeholder for %s.", item.sample_id)
-                waveform = torch.zeros(1, 16000, dtype=torch.float32)
+        # 1. Fail closed: never replace a missing training item with another sample or silence.
+        waveform = self.load_waveform(item)
 
         # 2. Extract 80-mel filterbank (KaldiFrontend handles scale 32768.0 and CMVN)
         feats, _ = self.frontend(waveform)

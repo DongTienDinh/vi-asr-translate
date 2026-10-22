@@ -41,6 +41,7 @@ class ASRInferencePipeline:
             fbank_waveform_multiplier=32768.0,
             eval_dither=0.0,
         )
+        self.frontend.eval()
 
     @classmethod
     def from_checkpoint(
@@ -53,9 +54,30 @@ class ASRInferencePipeline:
         """Instantiate pipeline from checkpoint and tokenizer artifacts."""
         tokenizer = Tokenizer(tokenizer_model_path)
 
+        ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        checkpoint_config = ckpt.get("config", {}) if isinstance(ckpt, dict) else {}
+
         global_cmvn = None
-        if cmvn_path and Path(cmvn_path).exists():
-            global_cmvn = GlobalCMVN.from_file(cmvn_path)
+        resolved_cmvn_path = Path(cmvn_path) if cmvn_path else None
+        if resolved_cmvn_path is None:
+            model_cfg = checkpoint_config.get("model", {})
+            encoder_id = model_cfg.get("encoder_id")
+            encoder_revision = model_cfg.get("encoder_revision")
+            if encoder_id and encoder_revision:
+                from huggingface_hub import hf_hub_download
+
+                resolved_cmvn_path = Path(
+                    hf_hub_download(
+                        repo_id=str(encoder_id),
+                        filename="global_cmvn",
+                        revision=str(encoder_revision),
+                    )
+                )
+        if resolved_cmvn_path is None or not resolved_cmvn_path.is_file():
+            raise FileNotFoundError(
+                "Pinned ViP-VL global_cmvn is required for deterministic inference"
+            )
+        global_cmvn = GlobalCMVN.from_file(resolved_cmvn_path)
 
         frontend = KaldiFrontend(
             fbank_waveform_multiplier=32768.0,
@@ -74,8 +96,7 @@ class ASRInferencePipeline:
         )
         model = ViPViCTCASR(adapter, vocab_size=tokenizer.vocab_size, blank_id=0)
 
-        # Load weights
-        ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        # Load only the ASR submodule; alignment is train-only and never enters inference.
         state_dict = ckpt["model_state_dict"] if "model_state_dict" in ckpt else ckpt
         # Clean state dict if wrapped in TinyASRSystem or DDP
         clean_state = {}
@@ -84,12 +105,14 @@ class ASRInferencePipeline:
                 clean_state[k[len("asr_model.") :]] = v
             elif k.startswith("module.asr_model."):
                 clean_state[k[len("module.asr_model.") :]] = v
+            elif k.startswith("alignment_module.") or k.startswith("module.alignment_module."):
+                continue
             elif k.startswith("module."):
                 clean_state[k[len("module.") :]] = v
             else:
                 clean_state[k] = v
 
-        model.load_state_dict(clean_state, strict=False)
+        model.load_state_dict(clean_state, strict=True)
         return cls(model=model, tokenizer=tokenizer, frontend=frontend, device=device)
 
     @torch.no_grad()

@@ -14,6 +14,7 @@ def setup_logger(
     """Setup structured logger with format and optional rank prefix."""
     logger = logging.getLogger(name)
     logger.setLevel(level)
+    logger.propagate = False
 
     # Avoid adding duplicate handlers if logger already configured
     if logger.handlers:

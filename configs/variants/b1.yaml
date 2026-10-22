@@ -1,5 +1,6 @@
 experiment:
   name: b1_ctc
+  protocol_version: b1_repro_v2
 
 alignment:
   enabled: false

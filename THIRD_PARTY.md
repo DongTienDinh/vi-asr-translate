@@ -8,7 +8,6 @@
 | [VinAIResearch/PhoBERT](https://github.com/VinAIResearch/PhoBERT) | `01daacda68afe13d83023d16ec647239e344a1e6` (HF) | Frozen text representations for offline token cache | MIT |
 | [VinAIResearch/VinAI_Translate](https://github.com/VinAIResearch/VinAI_Translate) | `ae7baa85da07dbe8e23ac26a9f5ef560c17e2138` (HF) | Post-ASR cascade Vietnamese-to-English translation | Apache-2.0 |
 | [nguyen-dv/ViMD_Dataset](https://github.com/nguyen-dv/ViMD_Dataset) | `3a5b30157034e7eadd5c75fae1a820c6f9383398` (HF) | Vietnamese multi-dialect speech dataset | CC BY-NC-ND 4.0 |
-| [openai/whisper](https://github.com/openai/whisper) | `small` multilingual checkpoint | External baseline ASR model | MIT |
 | [snakers4/silero-vad](https://github.com/snakers4/silero-vad) | v4.0 | Voice Activity Detection for streaming demo / long audio | MIT |
 
 ---

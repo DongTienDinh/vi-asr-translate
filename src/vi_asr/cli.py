@@ -4,10 +4,10 @@ import argparse
 import os
 import sys
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from vi_asr import __version__
-from vi_asr.config import dump_resolved_config, resolve_config
+from vi_asr.config import compute_config_hash, dump_resolved_config, resolve_config
 from vi_asr.utils.logging import setup_logger
 
 logger = setup_logger("vi_asr.cli")
@@ -152,6 +152,7 @@ def cmd_audit(args: argparse.Namespace) -> int:
 
     if train_manifest.exists():
         from vi_asr.data.audit import audit_splits
+        from vi_asr.data.tokenizer import Tokenizer
         valid_manifest = data_root / "valid.jsonl"
         if not valid_manifest.exists():
             valid_manifest = data_root / "manifests" / "valid.jsonl"
@@ -159,11 +160,27 @@ def cmd_audit(args: argparse.Namespace) -> int:
         if not test_manifest.exists():
             test_manifest = data_root / "manifests" / "test.jsonl"
 
+        tokenizer = None
+        tok_dir = _find_readable_path(
+            Path(cfg["paths"]["project_root"]) / "artifacts" / "tokenizer",
+            "/kaggle/working/vi_asr_project/artifacts/tokenizer",
+            check_file="bpe_1024.model",
+        )
+        tok_path = tok_dir / "bpe_1024.model"
+        if not tok_path.exists():
+            tok_path = _find_file("bpe_1024.model")
+        if tok_path.exists():
+            tokenizer = Tokenizer(tok_path)
+            logger.info("Including CTC validity checks with tokenizer %s.", tok_path)
+        else:
+            logger.warning("Tokenizer not found; CTC validity checks will be skipped.")
+
         logger.info("Found manifests in %s. Running full audit and leakage checks...", data_root)
         audit_summary = audit_splits(
             train_manifest=train_manifest,
             valid_manifest=valid_manifest if valid_manifest.exists() else None,
             test_manifest=test_manifest if test_manifest.exists() else None,
+            tokenizer=tokenizer,
             report_dir=report_dir,
         )
         logger.info("Audit completed. Total train samples: %d", audit_summary["splits"]["train"]["total_samples"])
@@ -286,6 +303,7 @@ def cmd_fetch_audio(args: argparse.Namespace) -> int:
 
     try:
         from datasets import Audio, load_dataset
+        from vi_asr.data.prepare import decode_audio_value
         import soundfile as sf
         from tqdm import tqdm
 
@@ -304,8 +322,7 @@ def cmd_fetch_audio(args: argparse.Namespace) -> int:
             sample_id = str(sample.get("id") or sample.get("sample_id") or f"{split}_{idx:06d}")
             out_file = split_audio_dir / f"{sample_id}.wav"
             if not out_file.exists():
-                audio_arr = sample["audio"]["array"]
-                sr = sample["audio"]["sampling_rate"]
+                audio_arr, sr = decode_audio_value(sample["audio"])
                 sf.write(str(out_file), audio_arr, sr, subtype="PCM_16")
                 count += 1
                 pbar.update(1)
@@ -435,11 +452,13 @@ def cmd_smoke(args: argparse.Namespace) -> int:
 
 def _run_ddp_training(args: argparse.Namespace, max_updates: Optional[int] = None) -> int:
     import json
+    import random
+    import numpy as np
     import torch
     from torch.utils.data import DataLoader
     from vi_asr.data.collate import asr_collate_fn
     from vi_asr.data.dataset import ASRDataset
-    from vi_asr.data.frontend import KaldiFrontend
+    from vi_asr.data.frontend import GlobalCMVN, KaldiFrontend
     from vi_asr.data.manifest import load_manifest
     from vi_asr.data.teacher_cache import TeacherCacheReader
     from vi_asr.data.tokenizer import Tokenizer
@@ -450,8 +469,10 @@ def _run_ddp_training(args: argparse.Namespace, max_updates: Optional[int] = Non
     from vi_asr.models.alignment import TokenFramePoolingAlignment
     from vi_asr.training.distributed import init_distributed, cleanup_distributed
     from vi_asr.training.distributed_sampler import GlobalDurationSampler, ValidationShardSampler
+    from vi_asr.training.dataloader import dataloader_kwargs
     from vi_asr.training.overfit import TinyASRSystem
     from vi_asr.training.trainer import DDPASTrainer, create_warmup_linear_scheduler
+    from vi_asr.training.checkpoint import load_training_checkpoint
 
     cfg = resolve_config(
         base_path=args.config,
@@ -461,11 +482,27 @@ def _run_ddp_training(args: argparse.Namespace, max_updates: Optional[int] = Non
         overrides=args.override,
     )
 
+    base_seed = int(getattr(args, "seed", 42))
+    cfg.setdefault("experiment", {})["seed"] = base_seed
     rank, world_size, local_rank = init_distributed()
-    seed = int(getattr(args, "seed", 42)) + rank
-    torch.manual_seed(seed)
+    random.seed(base_seed)
+    np.random.seed(base_seed)
+    torch.manual_seed(base_seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(base_seed)
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
 
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+    run_dir = getattr(args, "run_dir", "runs/main")
+    output_dir = _get_writable_path(run_dir, run_dir)
+    config_hash = compute_config_hash(cfg)
+    if rank == 0:
+        dumped_hash = dump_resolved_config(cfg, output_dir / "resolved_config.yaml")
+        if dumped_hash != config_hash:
+            raise RuntimeError("Resolved configuration hash changed while writing run metadata")
 
     # 1. Locate data manifests
     data_root = _find_readable_path(cfg["paths"]["data_root"], "/kaggle/working/artifacts/prepared", check_file="train.jsonl")
@@ -496,15 +533,38 @@ def _run_ddp_training(args: argparse.Namespace, max_updates: Optional[int] = Non
 
     tokenizer = Tokenizer(tok_path)
 
-    # 3. Frontend & Teacher reader
+    # 3. Frontend & Teacher reader. CMVN is loaded from the same pinned ViP-VL snapshot.
     fe_cfg = cfg.get("frontend", {})
-    frontend = KaldiFrontend(
+    m_cfg = cfg.get("model", {})
+    encoder_id = m_cfg.get("encoder_id", "khanhld/vip-vl-base-vie")
+    encoder_rev = m_cfg.get("encoder_revision", "4b259337d96450d57403acdee82572c587151e22")
+    from huggingface_hub import hf_hub_download
+
+    cmvn_path = Path(
+        hf_hub_download(
+            repo_id=str(encoder_id),
+            filename="global_cmvn",
+            revision=str(encoder_rev),
+        )
+    )
+    train_cmvn = GlobalCMVN.from_file(cmvn_path)
+    valid_cmvn = GlobalCMVN.from_file(cmvn_path)
+
+    frontend_kwargs = dict(
         sample_rate=int(fe_cfg.get("sample_rate", 16000)),
         num_mel_bins=int(fe_cfg.get("num_mel_bins", 80)),
         frame_length_ms=float(fe_cfg.get("frame_length_ms", 25.0)),
         frame_shift_ms=float(fe_cfg.get("frame_shift_ms", 10.0)),
+        window_type=str(fe_cfg.get("window_type", "povey")),
+        energy_floor=float(fe_cfg.get("energy_floor", 0.0)),
+        train_dither=float(fe_cfg.get("train_dither", 1.0)),
+        eval_dither=float(fe_cfg.get("eval_dither", 0.0)),
         fbank_waveform_multiplier=float(fe_cfg.get("fbank_waveform_multiplier", 32768.0)),
     )
+    train_frontend = KaldiFrontend(**frontend_kwargs, global_cmvn=train_cmvn)
+    valid_frontend = KaldiFrontend(**frontend_kwargs, global_cmvn=valid_cmvn)
+    train_frontend.train()
+    valid_frontend.eval()
 
     teacher_reader = None
     if cfg.get("alignment", {}).get("enabled", False):
@@ -527,7 +587,7 @@ def _run_ddp_training(args: argparse.Namespace, max_updates: Optional[int] = Non
 
     train_ds = ASRDataset(
         manifest_items=train_items,
-        frontend=frontend,
+        frontend=train_frontend,
         tokenizer=tokenizer,
         audio_root=data_root,
         specaugment=specaug,
@@ -539,7 +599,7 @@ def _run_ddp_training(args: argparse.Namespace, max_updates: Optional[int] = Non
     if val_items:
         val_ds = ASRDataset(
             manifest_items=val_items,
-            frontend=frontend,
+            frontend=valid_frontend,
             tokenizer=tokenizer,
             audio_root=data_root,
             specaugment=None,
@@ -548,7 +608,6 @@ def _run_ddp_training(args: argparse.Namespace, max_updates: Optional[int] = Non
         )
 
     # 5. Model construction
-    m_cfg = cfg.get("model", {})
     adapter = ChunkFormerEncoderAdapter(
         input_size=int(fe_cfg.get("num_mel_bins", 80)),
         output_size=512,
@@ -562,12 +621,18 @@ def _run_ddp_training(args: argparse.Namespace, max_updates: Optional[int] = Non
         gradient_checkpointing=bool(m_cfg.get("activation_checkpointing", True)),
     )
 
-    encoder_id = m_cfg.get("encoder_id", "khanhld/vip-vl-base-vie")
-    encoder_rev = m_cfg.get("encoder_revision", "4b259337d96450d57403acdee82572c587151e22")
     try:
-        load_vip_vl_pretrained(adapter, checkpoint_path_or_repo=encoder_id, revision=encoder_rev)
+        load_report = load_vip_vl_pretrained(
+            adapter,
+            checkpoint_path_or_repo=encoder_id,
+            revision=encoder_rev,
+            report_path=output_dir / "load_report.json" if rank == 0 else None,
+        )
     except Exception as e:
-        logger.warning("Could not load pretrained ViP-VL weights from %s: %s", encoder_id, e)
+        raise RuntimeError(
+            f"Could not load the pinned ViP-VL checkpoint from {encoder_id}; "
+            "refusing to train a silently random-initialized backbone"
+        ) from e
 
     asr_model = ViPViCTCASR(adapter, vocab_size=tokenizer.vocab_size, blank_id=0)
 
@@ -588,12 +653,22 @@ def _run_ddp_training(args: argparse.Namespace, max_updates: Optional[int] = Non
     system = TinyASRSystem(asr_model=asr_model, alignment_module=alignment_module).to(device)
 
     if world_size > 1 and torch.cuda.is_available():
+        runtime_cfg = cfg.get("runtime", {})
         system = torch.nn.parallel.DistributedDataParallel(
             system,
             device_ids=[local_rank],
             output_device=local_rank,
-            find_unused_parameters=True,
+            find_unused_parameters=bool(runtime_cfg.get("ddp_find_unused_parameters", False)),
+            gradient_as_bucket_view=bool(runtime_cfg.get("ddp_gradient_as_bucket_view", True)),
         )
+
+    # Rank-specific runtime RNG is set only after identical model initialization/DDP broadcast.
+    runtime_seed = base_seed + rank
+    random.seed(runtime_seed)
+    np.random.seed(runtime_seed)
+    torch.manual_seed(runtime_seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(runtime_seed)
 
     # 6. Samplers & DataLoaders
     batch_cfg = cfg.get("batching", {})
@@ -608,30 +683,49 @@ def _run_ddp_training(args: argparse.Namespace, max_updates: Optional[int] = Non
         rank=rank,
         max_samples_per_rank=max_samples,
         max_frames_per_rank=max_frames,
-        seed=seed,
+        seed=base_seed,
         shuffle=True,
+    )
+    runtime_cfg = cfg.get("runtime", {})
+    train_loader_options = dataloader_kwargs(
+        runtime_cfg,
+        cuda_available=torch.cuda.is_available(),
+        generator_seed=base_seed + rank,
     )
     train_loader = DataLoader(
         train_ds,
         batch_sampler=train_sampler,
         collate_fn=asr_collate_fn,
-        num_workers=0,
-        pin_memory=torch.cuda.is_available(),
+        **train_loader_options,
     )
 
     val_loader = None
     if val_ds:
         val_sampler = ValidationShardSampler(num_samples=len(val_ds), world_size=world_size, rank=rank)
+        val_loader_options = dataloader_kwargs(
+            runtime_cfg,
+            cuda_available=torch.cuda.is_available(),
+            generator_seed=base_seed + 50_000 + rank,
+        )
         val_loader = DataLoader(
             val_ds,
             batch_size=max_samples,
             sampler=val_sampler,
             collate_fn=asr_collate_fn,
-            num_workers=0,
+            **val_loader_options,
         )
 
-    run_dir = getattr(args, "run_dir", "runs/main")
-    output_dir = _get_writable_path(run_dir, run_dir)
+    logger.info(
+        "Input pipeline rank %d: workers=%d, prefetch=%s, persistent=%s, pin_memory=%s, "
+        "microbatch<=%d samples/rank, accumulation=%d",
+        rank,
+        train_loader.num_workers,
+        getattr(train_loader, "prefetch_factor", None),
+        getattr(train_loader, "persistent_workers", False),
+        train_loader.pin_memory,
+        max_samples,
+        accum_steps,
+    )
 
     trainer = DDPASTrainer(
         model=system,
@@ -646,9 +740,65 @@ def _run_ddp_training(args: argparse.Namespace, max_updates: Optional[int] = Non
 
     t_cfg = cfg.get("training", {})
     epochs = int(t_cfg.get("epochs", 20))
-    total_steps = epochs * len(train_loader)
+    microsteps_per_epoch = len(train_loader)
+    updates_per_epoch = (microsteps_per_epoch + accum_steps - 1) // accum_steps
+    total_steps = epochs * updates_per_epoch
     warmup_steps = int(float(t_cfg.get("warmup_fraction", 0.05)) * total_steps)
     scheduler = create_warmup_linear_scheduler(trainer.optimizer, warmup_steps=warmup_steps, total_steps=total_steps)
+    if rank == 0:
+        run_metadata = {
+            "config_sha256": config_hash,
+            "base_seed": base_seed,
+            "world_size": world_size,
+            "microsteps_per_epoch": microsteps_per_epoch,
+            "optimizer_updates_per_epoch": updates_per_epoch,
+            "total_optimizer_updates": total_steps,
+            "warmup_updates": warmup_steps,
+            "encoder_checkpoint_sha256": load_report["checkpoint_sha256"],
+            "cmvn_file": str(cmvn_path),
+        }
+        with (output_dir / "run_metadata.json").open("w", encoding="utf-8") as stream:
+            json.dump(run_metadata, stream, indent=2, ensure_ascii=False)
+
+    start_epoch = 1
+    resume_metrics = None
+    resume_arg = getattr(args, "resume", None)
+    if resume_arg:
+        import shutil
+
+        resume_path = _find_file(resume_arg)
+        if not resume_path.is_file():
+            raise FileNotFoundError(f"Resume checkpoint not found: {resume_arg}")
+        resumed = load_training_checkpoint(
+            checkpoint_path=resume_path,
+            model=system,
+            optimizer=trainer.optimizer,
+            scaler=trainer.scaler,
+            scheduler=scheduler,
+            restore_rng=True,
+            device="cpu",
+        )
+        saved_config = resumed.get("config")
+        if not saved_config or compute_config_hash(saved_config) != config_hash:
+            raise RuntimeError(
+                "Resume checkpoint configuration does not match this B1 run; refusing mixed protocol"
+            )
+        trainer.global_updates = int(resumed.get("global_step", 0))
+        start_epoch = int(resumed.get("epoch", 0)) + 1
+        resume_metrics = resumed.get("metrics") or {}
+        prior_best = resume_path.parent / "checkpoint_best.pt"
+        carried_best = output_dir / "checkpoint_best.pt"
+        if rank == 0 and prior_best.is_file() and prior_best.resolve() != carried_best.resolve():
+            shutil.copy2(prior_best, carried_best)
+            logger.info("Carried previous best checkpoint into this session: %s", carried_best)
+        if world_size > 1 and torch.distributed.is_initialized():
+            torch.distributed.barrier()
+        logger.info(
+            "Resume ready: checkpoint=%s, next_epoch=%d, global_updates=%d",
+            resume_path,
+            start_epoch,
+            trainer.global_updates,
+        )
 
     logger.info("Starting training in %s on rank %d/%d...", output_dir, rank, world_size)
     summary = trainer.fit(
@@ -658,6 +808,9 @@ def _run_ddp_training(args: argparse.Namespace, max_updates: Optional[int] = Non
         scheduler=scheduler,
         max_updates=max_updates,
         train_sampler=train_sampler,
+        start_epoch=start_epoch,
+        epochs_this_session=getattr(args, "epochs_this_session", None),
+        resume_metrics=resume_metrics,
     )
     logger.info("Training finished. Summary: %s", summary)
 
@@ -682,9 +835,12 @@ def cmd_train(args: argparse.Namespace) -> int:
 def cmd_evaluate_asr(args: argparse.Namespace) -> int:
     """Evaluate ASR model checkpoint on test or validation split."""
     import json
+    import torch
+    from vi_asr.data.audio_store import SHARD_INDEX_FILENAME, ShardedZipAudioReader
     from vi_asr.data.manifest import load_manifest
     from vi_asr.evaluation.metrics import compute_wer_cer
     from vi_asr.inference.transcribe import ASRInferencePipeline
+    from vi_asr.models.checkpoint import compute_file_sha256
 
     cfg = resolve_config(
         base_path=args.config,
@@ -715,32 +871,82 @@ def cmd_evaluate_asr(args: argparse.Namespace) -> int:
         return 1
 
     items = load_manifest(manifest_file)
+    checkpoint_data = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    checkpoint_config = checkpoint_data.get("config", {}) if isinstance(checkpoint_data, dict) else {}
+    checkpoint_metrics = checkpoint_data.get("metrics", {}) if isinstance(checkpoint_data, dict) else {}
+    checkpoint_epoch = checkpoint_data.get("epoch") if isinstance(checkpoint_data, dict) else None
+    checkpoint_global_step = checkpoint_data.get("global_step") if isinstance(checkpoint_data, dict) else None
+    training_config_sha256 = compute_config_hash(checkpoint_config) if checkpoint_config else None
+    del checkpoint_data
     pipeline = ASRInferencePipeline.from_checkpoint(ckpt_path, tok_path)
 
     logger.info("Evaluating %d samples from split '%s'...", len(items), split_name)
     hyps: List[str] = []
     refs: List[str] = []
     results_by_sample = []
+    missing_audio: List[str] = []
+    shard_reader = (
+        ShardedZipAudioReader(data_root)
+        if (data_root / SHARD_INDEX_FILENAME).is_file()
+        else None
+    )
 
-    for item in items:
-        audio_path = data_root / item.audio_relpath
-        if not audio_path.exists():
-            audio_path = Path(item.audio_relpath)
+    try:
+        for item in items:
+            audio_path = data_root / item.audio_relpath
+            if not audio_path.is_file():
+                audio_path = Path(item.audio_relpath)
 
-        if not audio_path.exists():
-            continue
+            if audio_path.is_file():
+                hyp = pipeline.transcribe_file(audio_path)
+            elif shard_reader is not None and item.audio_relpath in shard_reader:
+                waveform, sample_rate = shard_reader.read(item.audio_relpath)
+                if sample_rate != 16000:
+                    raise RuntimeError(
+                        f"Prepared shard audio must be 16 kHz, got {sample_rate} for {item.sample_id}"
+                    )
+                hyp = pipeline.transcribe_waveform(torch.from_numpy(waveform))
+            else:
+                missing_audio.append(f"{item.sample_id}:{item.audio_relpath}")
+                continue
 
-        hyp = pipeline.transcribe_file(audio_path)
-        hyps.append(hyp)
-        refs.append(item.text_asr)
-        results_by_sample.append({
-            "sample_id": item.sample_id,
-            "reference": item.text_asr,
-            "hypothesis": hyp,
-            "region_id": item.region_id,
-        })
+            hyps.append(hyp)
+            refs.append(item.text_asr)
+            results_by_sample.append({
+                "sample_id": item.sample_id,
+                "reference": item.text_asr,
+                "hypothesis": hyp,
+                "region_id": item.region_id,
+            })
+    finally:
+        if shard_reader is not None:
+            shard_reader.close()
+
+    if missing_audio:
+        raise FileNotFoundError(
+            f"ASR evaluation aborted: missing audio for {len(missing_audio)}/{len(items)} samples; "
+            f"examples={missing_audio[:5]}"
+        )
+    if len(results_by_sample) != len(items):
+        raise RuntimeError(
+            f"ASR evaluation coverage mismatch: decoded={len(results_by_sample)}, manifest={len(items)}"
+        )
 
     metrics = compute_wer_cer(hyps, refs)
+    region_names = {0: "north", 1: "central", 2: "south"}
+    metrics_by_region: Dict[str, Any] = {}
+    for region_id, region_name in region_names.items():
+        region_rows = [row for row in results_by_sample if row["region_id"] == region_id]
+        if region_rows:
+            region_metrics = compute_wer_cer(
+                [row["hypothesis"] for row in region_rows],
+                [row["reference"] for row in region_rows],
+            )
+            metrics_by_region[region_name] = {
+                "region_id": region_id,
+                "samples": len(region_rows),
+                **region_metrics,
+            }
     logger.info("ASR Evaluation [%s]: WER = %.4f | CER = %.4f", split_name, metrics["wer"], metrics["cer"])
 
     run_dir = _get_writable_path(args.run_dir or "eval/asr", "eval/asr")
@@ -749,59 +955,17 @@ def cmd_evaluate_asr(args: argparse.Namespace) -> int:
         json.dump({
             "split": split_name,
             "checkpoint": str(ckpt_path),
+            "checkpoint_sha256": compute_file_sha256(ckpt_path),
+            "checkpoint_epoch": checkpoint_epoch,
+            "checkpoint_global_step": checkpoint_global_step,
+            "checkpoint_selection_metrics": checkpoint_metrics,
+            "training_config_sha256": training_config_sha256,
+            "coverage": {"decoded": len(results_by_sample), "manifest": len(items)},
             "metrics": metrics,
+            "metrics_by_region": metrics_by_region,
             "samples": results_by_sample,
         }, f, indent=2, ensure_ascii=False)
     logger.info("Saved evaluation results to %s", out_file)
-    return 0
-
-
-def cmd_baseline_whisper(args: argparse.Namespace) -> int:
-    """Run Whisper-small zero-shot multilingual baseline."""
-    import json
-    from vi_asr.data.manifest import load_manifest
-    from vi_asr.evaluation.metrics import compute_wer_cer
-    from vi_asr.evaluation.whisper_baseline import WhisperBaselineEvaluator
-
-    cfg = resolve_config(
-        base_path=args.config,
-        variant_path=args.variant,
-        profile_path=args.profile,
-        paths_path=args.paths,
-        overrides=args.override,
-    )
-
-    split_name = getattr(args, "split", "test")
-    data_root = _find_readable_path(cfg["paths"]["data_root"], "/kaggle/working/artifacts/prepared", check_file=f"{split_name}.jsonl")
-    manifest_file = data_root / f"{split_name}.jsonl"
-    if not manifest_file.exists():
-        manifest_file = data_root / "manifests" / f"{split_name}.jsonl"
-
-    if not manifest_file.exists():
-        logger.error("Manifest %s not found.", manifest_file)
-        return 1
-
-    items = load_manifest(manifest_file)
-    model_size = getattr(args, "model_size", "small")
-    whisper_pipe = WhisperBaselineEvaluator(model_name=f"openai/whisper-{model_size}")
-
-    hyps: List[str] = []
-    refs: List[str] = []
-    for item in items:
-        audio_path = data_root / item.audio_relpath
-        if not audio_path.exists():
-            audio_path = Path(item.audio_relpath)
-        if not audio_path.exists():
-            continue
-        hyp = whisper_pipe.transcribe_audio_file(str(audio_path))
-        hyps.append(hyp)
-        refs.append(item.text_asr)
-
-    metrics = compute_wer_cer(hyps, refs)
-    logger.info("Whisper-%s Evaluation: WER = %.4f | CER = %.4f", model_size, metrics["wer"], metrics["cer"])
-    out_dir = _get_writable_path(f"eval/whisper_{model_size}", f"eval/whisper_{model_size}")
-    with open(out_dir / f"eval_{split_name}.json", "w", encoding="utf-8") as f:
-        json.dump({"model": f"whisper-{model_size}", "metrics": metrics}, f, indent=2)
     return 0
 
 
@@ -998,6 +1162,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_train.add_argument("--seed", type=int, default=42, help="Random seed")
     p_train.add_argument("--run-dir", type=str, default="runs/main", help="Output directory")
     p_train.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
+    p_train.add_argument(
+        "--epochs-this-session",
+        type=int,
+        default=None,
+        help="Stop cleanly after this many epochs while preserving the configured total schedule",
+    )
     p_train.set_defaults(func=cmd_train)
 
     # evaluate-asr
@@ -1007,13 +1177,6 @@ def build_parser() -> argparse.ArgumentParser:
     p_eval_asr.add_argument("--split", type=str, default="valid", help="Split to evaluate (valid/test)")
     p_eval_asr.add_argument("--run-dir", type=str, default="eval/asr", help="Output evaluation directory")
     p_eval_asr.set_defaults(func=cmd_evaluate_asr)
-
-    # baseline-whisper
-    p_whisper = subparsers.add_parser("baseline-whisper", help="Run Whisper zero-shot baseline")
-    add_common_config_args(p_whisper)
-    p_whisper.add_argument("--model-size", type=str, default="small", help="Whisper model size")
-    p_whisper.add_argument("--split", type=str, default="test", help="Split to evaluate")
-    p_whisper.set_defaults(func=cmd_baseline_whisper)
 
     # evaluate-cascade
     p_casc = subparsers.add_parser("evaluate-cascade", help="Evaluate full ASR -> VinAI MT cascade")

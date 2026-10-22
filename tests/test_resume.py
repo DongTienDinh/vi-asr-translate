@@ -41,6 +41,23 @@ class TestAtomicResume(unittest.TestCase):
             self.assertTrue(saved_file.exists())
             self.assertTrue((ckpt_dir / "checkpoint_latest.pt").exists())
             self.assertTrue((ckpt_dir / "checkpoint_best.pt").exists())
+            self.assertTrue(saved_file.samefile(ckpt_dir / "checkpoint_latest.pt"))
+            self.assertTrue(saved_file.samefile(ckpt_dir / "checkpoint_best.pt"))
+
+            # A later checkpoint prunes the older epoch snapshot and still
+            # serializes only one new full file.
+            second_file = save_training_checkpoint(
+                checkpoint_dir=ckpt_dir,
+                epoch=3,
+                global_step=200,
+                model=model,
+                optimizer=optimizer,
+                metrics={"valid_wer": 0.2},
+                is_best=False,
+            )
+            self.assertFalse(saved_file.exists())
+            self.assertTrue(second_file.samefile(ckpt_dir / "checkpoint_latest.pt"))
+            self.assertFalse(second_file.samefile(ckpt_dir / "checkpoint_best.pt"))
 
             # Create a fresh model and optimizer
             model_new = nn.Sequential(nn.Linear(10, 20), nn.ReLU(), nn.Linear(20, 5))
@@ -48,14 +65,14 @@ class TestAtomicResume(unittest.TestCase):
 
             # Load checkpoint
             data = load_training_checkpoint(
-                checkpoint_path=saved_file,
+                checkpoint_path=second_file,
                 model=model_new,
                 optimizer=optimizer_new,
             )
 
-            self.assertEqual(data["epoch"], 2)
-            self.assertEqual(data["global_step"], 150)
-            self.assertEqual(data["metrics"]["valid_wer"], 0.125)
+            self.assertEqual(data["epoch"], 3)
+            self.assertEqual(data["global_step"], 200)
+            self.assertEqual(data["metrics"]["valid_wer"], 0.2)
 
             # Verify identical parameters
             for p1, p2 in zip(model.parameters(), model_new.parameters()):

@@ -61,7 +61,7 @@
 | Temporal information | Gaussian prior yếu theo vị trí chuỗi; ablation bật/tắt | Không có tham số học ở bản đầu |
 | Dialect/region head | Nhánh phụ 3 vùng, mở rộng sau core | Chỉ khi bật thí nghiệm riêng |
 | MT | `vinai/vinai-translate-vi2en-v2` | Không |
-| External baseline | Whisper-small multilingual, zero-shot trên ViMD | Không |
+| Internal baseline | B1 = ViP-VL encoder + Linear CTC | Có |
 | ASR data | Official ViMD splits ở revision cố định | Train/valid/test riêng |
 
 **Core nghiên cứu:** B1 = ViP-VL+CTC; P1 = B1+token pooling; P2 = P1+temporal prior. Giữ nhánh vùng miền riêng để kiểm tra đóng góp, không đưa đồng thời mọi cải tiến rồi kết luận alignment tốt.
@@ -137,7 +137,6 @@ Tái sử dụng nguyên backbone; mỗi encoder block giữ cấu trúc macaron
 | [VinAIResearch/VinAI_Translate](https://github.com/VinAIResearch/VinAI_Translate) | Không bắt buộc | Cách load/generate và lưu ý benchmark | `translation.py` của nhóm |
 | [nguyen-dv/ViMD_Dataset](https://github.com/nguyen-dv/ViMD_Dataset) | Đọc; clone tùy chọn | Schema, split, citation | Data adapter/manifests của nhóm |
 | [vncorenlp/VnCoreNLP](https://github.com/vncorenlp/VnCoreNLP) | Không cần clone toàn bộ | Word segmenter qua wrapper + assets | Preparation script của nhóm |
-| [openai/whisper](https://github.com/openai/whisper) | Không cần nếu dùng pinned package | Baseline multilingual transcription | Baseline adapter của nhóm |
 | [snakers4/silero-vad](https://github.com/snakers4/silero-vad) | Không cần nếu dùng pinned package/assets | VAD phục vụ demo audio dài/mic | Segmenter adapter của nhóm |
 | MFGCN paper | Không có repo tác giả đã xác minh trong hồ sơ hiện tại | Ý tưởng text-conditioned weighted pooling | Alignment module tự hiện thực, ghi adaptation |
 | Deng et al. ICASSP 2022 | Không bắt buộc clone reimplementation | Text-guided CTC và token mapping | Tham khảo nguyên lý, không nhận bên thứ ba là official |
@@ -222,14 +221,13 @@ API và các lựa chọn checkpoint: [PyTorch checkpoint](https://docs.pytorch.
 | MT | `vinai/vinai-translate-vi2en-v2` | `ae7baa85da07dbe8e23ac26a9f5ef560c17e2138` |
 | Dataset | `nguyendv02/ViMD_Dataset` | `3a5b30157034e7eadd5c75fae1a820c6f9383398` |
 
-Những revision này chưa phải hash file tải trong một training run. Agent resolve/check lại, lưu snapshot metadata và SHA256 các file thực dùng. Whisper-small, VnCoreNLP, VAD, Python packages cần chốt version/assets hash trong preparation; không để `latest/main` chưa resolve trong thí nghiệm chính.
+Những revision này chưa phải hash file tải trong một training run. Agent resolve/check lại, lưu snapshot metadata và SHA256 các file thực dùng. VnCoreNLP, VAD và Python packages cần chốt version/assets hash trong preparation; không để `latest/main` chưa resolve trong thí nghiệm chính.
 
 ### 5.2 Tải weights
 
 - ViP-VL: `pytorch_model.pt`, `config.yaml`, `global_cmvn`, model card/license; encoder-only, task head khởi tạo mới.
 - PhoBERT: tokenizer/config và **một** bộ weights tương thích loader; giữ revision giống cache metadata.
 - VinAI: tokenizer/config/generation settings và một bộ weights; tải ở phiên evaluation hoặc lưu artifact riêng.
-- Whisper: official backend + multilingual `small`, ghi checksum/model identity, không dùng `small.en`.
 - VnCoreNLP: wrapper version, Java runtime, segmenter assets hashes.
 
 Không tải cả `.bin` và `.safetensors` nếu không dùng cả hai. Không sửa weights trong HF cache. API chuẩn: [HF download guide](https://huggingface.co/docs/huggingface_hub/guides/download).
@@ -391,7 +389,7 @@ Card ViMD hiện ghi CC BY-NC-ND 4.0. Giữ attribution/điều khoản nguồn;
 5. Dither train theo checkpoint recipe (điểm xuất phát 1.0), eval 0.0 để deterministic; khai báo rõ nếu thay đổi.
 6. Dùng `global_cmvn` của checkpoint. Nếu encoder tự CMVN thì không CMVN lần nữa ở dataset.
 
-So sánh frontend của nhóm với upstream cùng waveform, dither=0; assert shape và sai số. Sai scale/CMVN có thể làm fine-tune thất bại dù loss vẫn chạy. Không lấy config frontend từ Whisper rồi đưa trực tiếp vào ViP-VL.
+So sánh frontend của nhóm với upstream ViP-VL cùng waveform, dither=0; assert shape và sai số. Sai scale/CMVN có thể làm fine-tune thất bại dù loss vẫn chạy. Không lấy config frontend của một backbone ASR khác rồi đưa trực tiếp vào ViP-VL.
 
 ### 10.2 Augmentation
 
@@ -927,7 +925,7 @@ loss: {lambda_token: 0.1, lambda_region: 0.0}
 
 Optional `d1` = B1+region only, λ_region>0, λ_token=0; `p2d` = P2+region. Định nghĩa đủ YAML và không tự gộp chung với kết quả P2. Additive scorer là variant riêng nếu có budget.
 
-### 19.4 `configs/profiles/t4x2.yaml`
+### 19.4 `configs/profiles/t4x2_fast.yaml` (B1 protocol v2)
 
 ```yaml
 runtime:
@@ -941,21 +939,27 @@ runtime:
   pin_memory: true
   persistent_workers: false
   prefetch_factor: 2
+  non_blocking_transfers: true
+  progress_log_interval_updates: 20
   ddp_find_unused_parameters: false
   ddp_gradient_as_bucket_view: true
   ddp_static_graph: false
   process_group_timeout_minutes: 45
 batching:
-  max_samples_per_rank: 2
+  max_samples_per_rank: 4
   max_padded_fbank_frames_per_rank: 6400
-  accumulation_steps: 8
+  accumulation_steps: 4
   duration_bucketing: true
   training_tail_policy: drop_incomplete_rank_group_logged
   accumulation_normalization: global_sample_count
   validation_shard: no_padding_no_drop
 ```
 
-Single-T4 profile giữ effective batch tương đương: world_size1, max_samples2, accumulation16; tương tự mọi thứ khác nếu đo scaling. `cpu_smoke` tắt AMP/DDP/checkpoint patch demand khi không dùng path đó. Nếu workers=0 thì không truyền prefetch/persistent_worker arguments không phù hợp.
+Microbatch 4 × 2 ranks × accumulation 4 giữ effective batch 32. Mỗi rank dùng một
+spawned worker để overlap đọc ZIP/WAV và Kaldi fbank với GPU; epoch/rank worker seed được
+đặt lại xác định để resume ở biên epoch. `cpu_smoke` tắt AMP/DDP/checkpoint patch demand
+khi không dùng path đó. Nếu workers=0 thì không truyền prefetch/persistent_worker arguments
+không phù hợp.
 
 ### 19.5 Kaggle paths
 
@@ -976,16 +980,13 @@ Các slug trên là ví dụ artifact do nhóm tự chuẩn bị và attach; age
 
 | Run | Encoder/ASR | Token pooling | Temporal prior | Region loss | Vai trò |
 |---|---|---|---|---|---|
-| B_ref | Whisper-small zero-shot | Không | Không | Không | Baseline theo đề bài |
-| B1 | ViP-VL+CTC fine-tune | Không | Không | Không | Baseline kiến trúc trực tiếp |
+| B1 | ViP-VL+CTC fine-tune | Không | Không | Không | **Baseline duy nhất** |
 | P1 | Cùng B1 | Có | Không | Không | Đóng góp text-guided token pooling |
 | P2 | Cùng B1 | Có | Có | Không | Đóng góp prior mềm |
 | D1, optional | Cùng B1 | Không | Không | Có | Region-only |
 | P2D, optional | Cùng B1 | Có | Có | Có | Kết hợp region sau core |
 
-Whisper dùng `task=transcribe`, language Vietnamese; không dùng `task=translate` thay cascade vì sẽ không tạo đúng baseline transcript vi→VinAI. Ghi backend/version/model checksum, decoding params, segmentation và preprocessing. [Whisper official](https://github.com/openai/whisper).
-
-B_ref/P1/P2/B1 dùng cùng MT và normalization/segmentation eval. So sánh Whisper với model fine-tune phải ghi rõ khác nguồn pretraining/adaptation; causal claim về alignment chỉ dựa B1/P1/P2 cùng protocol.
+B1/P1/P2 dùng cùng pretrained encoder, CTC head initialization, tokenizer, frontend, train/valid/test, training budget, decoding và normalization. Vì chỉ P1/P2 thêm nhánh loss huấn luyện, chênh lệch với B1 mới có thể dùng để đánh giá đóng góp của token pooling/temporal prior trong phạm vi protocol này.
 
 ### 20.2 Fair comparison
 
@@ -995,9 +996,9 @@ Chọn λ/tau/prior bằng valid trong search nhỏ có ngân sách giống nhau
 
 ### 20.3 Số runs thực tế
 
-- Khởi đầu: B1/P1/P2 mỗi loại 1 seed + B_ref inference. Đây là 3 training runs, chưa đủ ước lượng biến động seed mạnh.
+- Khởi đầu: B1/P1/P2 mỗi loại 1 seed. Đây là 3 training runs, chưa đủ ước lượng biến động seed mạnh.
 - Củng cố với ngân sách vừa: chọn final variant bằng valid; chạy B1 và final trên 3 seeds. Nếu 3 runs đầu đã có seed42, thêm 4 runs → tổng **7 main training runs** (variant còn lại một seed). Ghi rõ số lần lặp khác nhau.
-- Đầy đủ core: B1/P1/P2 ×3 seeds = **9 training runs** + B_ref inference.
+- Đầy đủ core: B1/P1/P2 ×3 seeds = **9 training runs**.
 - Tuning/pilot/controls và region variants tính thêm, không giấu vào “một lần train”.
 
 Nếu ngân sách không đủ, giảm phạm vi trước, giữ báo cáo trung thực. Không gọi ba checkpoint từ một trajectory là ba seeds độc lập.
@@ -1225,7 +1226,7 @@ python -m vi_asr collect-results --runs-root /kaggle/working/runs --output /kagg
 
 Test/cascade chỉ chạy sau protocol freeze theo mục 24–25. `evaluate-asr` mặc định single GPU nếu không được launch torchrun, ghi device và benchmark context; không tự suy inference benchmark hai GPU từ training profile. `export-asr` lấy resolved config trong checkpoint nên không bắt buộc `--config`; `collect-results` không cần model config.
 
-Agent phải có `--help` cho mọi lệnh, lỗi đường dẫn rõ ràng, fail nếu artifact thiếu; không tạo file empty rồi báo xong. Các commands bổ sung `baseline-whisper`, `evaluate-cascade`, `benchmark`, `demo`, `verify-bundle` cần cùng quy ước paths/output và tài liệu sử dụng.
+Agent phải có `--help` cho mọi lệnh, lỗi đường dẫn rõ ràng, fail nếu artifact thiếu; không tạo file empty rồi báo xong. Các commands bổ sung `evaluate-cascade`, `benchmark`, `demo`, `verify-bundle` cần cùng quy ước paths/output và tài liệu sử dụng.
 
 ## 24. Metric, thống kê và lỗi ASR
 
@@ -1280,7 +1281,7 @@ Evaluation load VinAI sau khi trainer đã kết thúc/unload. Có thể dùng G
 | Đường | Input MT | Mục đích |
 |---|---|---|
 | MT trên transcript chuẩn | Reference Vietnamese text | Mốc kiểm tra MT khi không có lỗi ASR |
-| Cascade baseline | Transcript từ Whisper/B1 | Mốc hệ thống |
+| Cascade baseline | Transcript từ B1 | Mốc hệ thống |
 | Cascade proposed | Transcript từ P1/P2 | Tác động thay ASR dưới cùng MT |
 
 Transcript chuẩn → MT là mốc chẩn đoán, không phải “upper bound” toán học bảo đảm cao nhất. Đôi khi lỗi ASR có thể tình cờ hợp reference English hơn; không suy đơn điệu từ WER sang BLEU.
@@ -1439,6 +1440,7 @@ Các link primary/official dưới đây dùng cho kiến trúc và cách vận 
 | [ChunkFormer, ICASSP2025 paper](https://arxiv.org/abs/2502.14673) | Backbone và long-form speech transcription |
 | [ChunkFormer official source](https://github.com/khanld/chunkformer) | Encoder/frontend/recipe; chốt SHA trước tái sử dụng |
 | [ViP-VL paper](https://arxiv.org/abs/2606.10360) và [checkpoint](https://huggingface.co/khanhld/vip-vl-base-vie) | Pretrained Vietnamese encoder và encoder config |
+| [CTC, ICML 2006](https://doi.org/10.1145/1143844.1143891) | Hàm mục tiêu để học chuỗi nhãn từ audio không cần frame-level alignment |
 | [PhoBERT, Findings EMNLP2020](https://aclanthology.org/2020.findings-emnlp.92/) | Vietnamese text representations |
 | [PhoBERT official repo](https://github.com/VinAIResearch/PhoBERT) | Word segmentation/max length/usage/license |
 | [VnCoreNLP official](https://github.com/vncorenlp/VnCoreNLP) | Segmenter assets/preprocessing |
@@ -1447,7 +1449,6 @@ Các link primary/official dưới đây dùng cho kiến trúc và cách vận 
 | [ViMD, EMNLP2024](https://aclanthology.org/2024.emnlp-main.426/) và [dataset](https://huggingface.co/datasets/nguyendv02/ViMD_Dataset) | Dữ liệu/nhãn/phân tích đa vùng miền |
 | [VinAI Translate, INTERSPEECH2022](https://www.isca-archive.org/interspeech_2022/nguyen22e_interspeech.html) | Hệ thống dịch Việt–Anh |
 | [VinAI official repo](https://github.com/VinAIResearch/VinAI_Translate) và [v2 checkpoint](https://huggingface.co/vinai/vinai-translate-vi2en-v2) | Load/generate/settings và contamination note |
-| [Whisper official](https://github.com/openai/whisper) | External ASR baseline |
 | [PyTorch DDP design](https://docs.pytorch.org/docs/2.9/notes/ddp.html) | Data parallel gradient synchronization |
 | [DDP API](https://docs.pytorch.org/docs/2.9/generated/torch.nn.parallel.DistributedDataParallel.html) | Wrapper/no_sync/parameter constraints |
 | [DDP tutorial](https://docs.pytorch.org/tutorials/intermediate/ddp_tutorial.html) | Process setup/checkpoint patterns |
@@ -1470,7 +1471,7 @@ Link PyTorch2.9 làm mốc API có version, **không yêu cầu Kaggle cài đú
 >
 > Xây training trên Kaggle2T4 bằng DDP2 processes, FP16 AMP, duration-aware sampler có cùng step boundaries, accumulation chuẩn hóa theo global sample count, validation không duplicate/drop mẫu, rank0 checkpoint và per-rank state để resume. Kiểm tra gradient_checkpointing có thật trên encoder; nếu chưa, patch non-reentrant checkpoint từng block và test output/gradient/memory. Tắt LayerDrop core, tránh unused heads. Chạy one-GPU smoke, tiny overfit, DDP gradient equivalence, two-GPU pilot, resume/export tests trước main.
 >
-> Triển khai B_ref Whisper-small zero-shot, B1 CTC, P1 token pooling, P2 thêm prior theo cùng protocol. Nếu đủ budget mới thêm region/additive/controls, không trộn thay đổi rồi quy kết. Chọn bằng validation, freeze protocol trước test; báo WER/CER overall/theo vùng và cascade BLEU/chrF++ trên tập có English references hợp lệ. Giữ MT settings cố định, ghi rõ PhoMT/mTet-v2 contamination note khi liên quan. Không tự tạo điểm hoặc hứa T4 memory/runtime khi chưa đo.
+> Triển khai B1 CTC làm baseline duy nhất, P1 thêm token pooling, P2 thêm prior theo cùng protocol. Nếu đủ budget mới thêm region/additive/controls, không trộn thay đổi rồi quy kết. Chọn bằng validation, freeze protocol trước test; báo WER/CER overall/theo vùng và cascade BLEU/chrF++ trên tập có English references hợp lệ. Giữ MT settings cố định, ghi rõ PhoMT/mTet-v2 contamination note khi liên quan. Không tự tạo điểm hoặc hứa T4 memory/runtime khi chưa đo.
 >
 > Bàn giao source ZIP+SHA256, notebooks Kaggle, configs/lock đã xác minh, README, source audit/patch/license/provenance, data/cache preparation scripts, actual test/pilot logs, checkpoint/resume instructions, inference bundle và demo upload/microphone song ngữ. CLI trong tài liệu là contract cần xây; không dừng ở skeleton. Đánh dấu rõ code_ready/smoke_passed/pilot_passed/completed và công việc chưa chạy nếu không có runtime. Không sửa tài liệu synced trong sources/. Mỗi quyết định chưa chốt dùng lựa chọn đơn giản đã mô tả, ghi assumption và tiếp tục các phần độc lập.
 

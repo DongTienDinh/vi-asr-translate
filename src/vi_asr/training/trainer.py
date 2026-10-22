@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 import math
 import time
 from pathlib import Path
@@ -18,7 +17,7 @@ from vi_asr.data.collate import asr_collate_fn
 from vi_asr.training.distributed_sampler import GlobalDurationSampler, ValidationShardSampler
 from vi_asr.models.alignment import TokenFramePoolingAlignment
 from vi_asr.models.ctc_asr import ViPViCTCASR
-from vi_asr.training.checkpoint import load_training_checkpoint, save_training_checkpoint
+from vi_asr.training.checkpoint import capture_rng_states, save_training_checkpoint
 from vi_asr.training.distributed import (
     all_reduce_sample_count,
     get_rank,
@@ -26,9 +25,11 @@ from vi_asr.training.distributed import (
     is_main_process,
     rescale_gradients_by_sample_count,
 )
+from vi_asr.training.dataloader import reseed_loader_for_epoch
 from vi_asr.training.losses import MultiTaskASRLoss
+from vi_asr.utils.logging import setup_logger
 
-logger = logging.getLogger(__name__)
+logger = setup_logger(__name__)
 
 
 def create_warmup_linear_scheduler(
@@ -124,6 +125,10 @@ class DDPASTrainer:
         self.optimizer = AdamW(params)
         self.epochs = int(train_cfg.get("epochs", 20))
         self.global_updates = 0
+        runtime_cfg = self.config.get("runtime", {})
+        self.base_seed = int(self.config.get("experiment", {}).get("seed", 42))
+        self.progress_log_interval = max(1, int(runtime_cfg.get("progress_log_interval_updates", 20)))
+        self.non_blocking_transfers = bool(runtime_cfg.get("non_blocking_transfers", True))
 
     def train_epoch(
         self,
@@ -133,19 +138,27 @@ class DDPASTrainer:
         max_updates: Optional[int] = None,
     ) -> float:
         self.model.train()
-        total_loss = 0.0
+        total_loss = torch.zeros((), device=self.device, dtype=torch.float64)
         microstep_count = 0
         optimizer_updates = 0
+        epoch_started = time.perf_counter()
+        progress_started = epoch_started
+        last_batch_finished = epoch_started
+        data_wait_seconds = 0.0
+        progress_loss = torch.zeros((), device=self.device, dtype=torch.float64)
+        progress_microsteps = 0
+        progress_global_samples = 0
 
         # Accumulated samples across microsteps within one accumulation window
         accum_samples_local = 0
         self.optimizer.zero_grad()
 
         for batch_idx, batch in enumerate(train_loader):
+            data_wait_seconds += time.perf_counter() - last_batch_finished
             # Move tensors to device
             for k in ("feats", "feat_lengths", "ctc_targets", "target_lengths", "teacher_states", "teacher_lengths"):
                 if k in batch and isinstance(batch[k], torch.Tensor):
-                    batch[k] = batch[k].to(self.device)
+                    batch[k] = batch[k].to(self.device, non_blocking=self.non_blocking_transfers)
 
             local_b = batch["feats"].size(0)
             accum_samples_local += local_b
@@ -188,8 +201,11 @@ class DDPASTrainer:
                     scaled_loss = raw_loss / self.accumulation_steps
                     scaled_loss.backward()
 
-            total_loss += raw_loss.item()
+            detached_loss = raw_loss.detach().to(dtype=torch.float64)
+            total_loss += detached_loss
+            progress_loss += detached_loss
             microstep_count += 1
+            progress_microsteps += 1
 
             if is_accum_boundary:
                 # 1. All-reduce total samples W across all ranks in this update
@@ -220,11 +236,51 @@ class DDPASTrainer:
                 accum_samples_local = 0
                 optimizer_updates += 1
                 self.global_updates += 1
+                progress_global_samples += W
+
+                should_log = (
+                    optimizer_updates % self.progress_log_interval == 0
+                    or batch_idx == len(train_loader) - 1
+                )
+                if should_log:
+                    now = time.perf_counter()
+                if self.rank == 0 and should_log:
+                    window_seconds = max(now - progress_started, 1e-9)
+                    epoch_seconds = max(now - epoch_started, 1e-9)
+                    mean_loss = float(progress_loss.item()) / max(1, progress_microsteps)
+                    lr = float(self.optimizer.param_groups[0]["lr"])
+                    memory_gib = (
+                        torch.cuda.max_memory_allocated(self.device) / (1024 ** 3)
+                        if self.device.type == "cuda"
+                        else 0.0
+                    )
+                    logger.info(
+                        "Epoch %d progress %d/%d microsteps (%.1f%%) | update=%d | "
+                        "loss=%.4f | %.2f global samples/s | data_wait=%.1f%% | "
+                        "lr=%.3e | peak_gpu=%.2f GiB",
+                        epoch,
+                        batch_idx + 1,
+                        len(train_loader),
+                        100.0 * (batch_idx + 1) / max(1, len(train_loader)),
+                        self.global_updates,
+                        mean_loss,
+                        progress_global_samples / window_seconds,
+                        100.0 * data_wait_seconds / epoch_seconds,
+                        lr,
+                        memory_gib,
+                    )
+                if should_log:
+                    progress_started = now
+                    progress_loss.zero_()
+                    progress_microsteps = 0
+                    progress_global_samples = 0
 
                 if max_updates is not None and self.global_updates >= max_updates:
                     break
 
-        avg_loss = total_loss / max(1, microstep_count)
+            last_batch_finished = time.perf_counter()
+
+        avg_loss = float(total_loss.item()) / max(1, microstep_count)
         return avg_loss
 
     @torch.no_grad()
@@ -232,7 +288,7 @@ class DDPASTrainer:
         """Evaluate validation set, compute loss and optional WER/CER."""
         raw_m = self.model.module if hasattr(self.model, "module") else self.model
         self.model.eval()
-        total_val_loss = 0.0
+        total_val_loss = torch.zeros((), device=self.device, dtype=torch.float64)
         steps = 0
         all_hyps: List[str] = []
         all_refs: List[str] = []
@@ -240,7 +296,7 @@ class DDPASTrainer:
         for batch in val_loader:
             for k in ("feats", "feat_lengths", "ctc_targets", "target_lengths", "teacher_states", "teacher_lengths"):
                 if k in batch and isinstance(batch[k], torch.Tensor):
-                    batch[k] = batch[k].to(self.device)
+                    batch[k] = batch[k].to(self.device, non_blocking=self.non_blocking_transfers)
 
             out = self.model(batch)
             loss_dict = self.loss_fn(
@@ -252,24 +308,45 @@ class DDPASTrainer:
                 target_teacher=batch.get("teacher_states"),
                 token_lengths=batch.get("teacher_lengths"),
             )
-            total_val_loss += loss_dict["loss"].item()
+            total_val_loss += loss_dict["loss"].detach().to(dtype=torch.float64)
             steps += 1
 
             if tokenizer is not None:
                 asr_net = raw_m.asr_model if hasattr(raw_m, "asr_model") else raw_m
-                if hasattr(asr_net, "transcribe"):
-                    hyp_ids = asr_net.transcribe(batch["feats"], batch["feat_lengths"])
-                else:
-                    logits = out["logits"]
-                    preds = torch.argmax(logits, dim=-1)
-                    hyp_ids = [preds[i, : int(out["output_lengths"][i])].tolist() for i in range(preds.size(0))]
+                blank_id = int(getattr(asr_net, "blank_id", 0))
+                preds = torch.argmax(out["logits"], dim=-1)
+                hyp_ids = []
+                for i in range(preds.size(0)):
+                    valid_t = int(out["output_lengths"][i].item())
+                    path = preds[i, :valid_t].tolist()
+                    collapsed = []
+                    previous = -1
+                    for token_id in path:
+                        if token_id != previous:
+                            if token_id != blank_id:
+                                collapsed.append(token_id)
+                            previous = token_id
+                    hyp_ids.append(collapsed)
 
                 refs = batch.get("transcripts") or []
                 for h_ids, ref_str in zip(hyp_ids, refs):
                     all_hyps.append(tokenizer.decode(h_ids) if hasattr(tokenizer, "decode") else "")
                     all_refs.append(str(ref_str))
 
-        avg_loss = total_val_loss / max(1, steps)
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            loss_stats = torch.stack(
+                [total_val_loss, torch.tensor(float(steps), dtype=torch.float64, device=self.device)]
+            )
+            torch.distributed.all_reduce(loss_stats, op=torch.distributed.ReduceOp.SUM)
+            total_val_loss = loss_stats[0]
+            steps = int(loss_stats[1].item())
+
+            gathered: List[Any] = [None for _ in range(self.world_size)]
+            torch.distributed.all_gather_object(gathered, (all_hyps, all_refs))
+            all_hyps = [hyp for rank_hyps, _ in gathered for hyp in rank_hyps]
+            all_refs = [ref for _, rank_refs in gathered for ref in rank_refs]
+
+        avg_loss = float(total_val_loss.item()) / max(1, steps)
         metrics: Dict[str, Any] = {"val_loss": avg_loss}
 
         if all_hyps and all_refs:
@@ -291,37 +368,75 @@ class DDPASTrainer:
         scheduler: Optional[Any] = None,
         max_updates: Optional[int] = None,
         train_sampler: Optional[Any] = None,
+        start_epoch: int = 1,
+        epochs_this_session: Optional[int] = None,
+        resume_metrics: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Run complete training loop across epochs or until max_updates."""
-        best_wer = float("inf")
-        best_loss = float("inf")
-        best_epoch = 0
+        resume_metrics = resume_metrics or {}
+        best_wer = float(resume_metrics.get("best_wer", float("inf")))
+        best_cer = float(resume_metrics.get("best_cer", float("inf")))
+        best_loss = float(resume_metrics.get("best_loss", float("inf")))
+        best_epoch = int(resume_metrics.get("best_epoch", 0))
 
-        for epoch in range(1, self.epochs + 1):
+        final_epoch = self.epochs
+        if epochs_this_session is not None:
+            if epochs_this_session <= 0:
+                raise ValueError("epochs_this_session must be positive")
+            final_epoch = min(self.epochs, start_epoch + epochs_this_session - 1)
+
+        for epoch in range(start_epoch, final_epoch + 1):
             if train_sampler is not None and hasattr(train_sampler, "set_epoch"):
                 train_sampler.set_epoch(epoch)
 
-            logger.info("Epoch %d/%d starting...", epoch, self.epochs)
+            worker_seed = reseed_loader_for_epoch(
+                train_loader,
+                base_seed=self.base_seed,
+                epoch=epoch,
+                rank=self.rank,
+            )
+            if self.rank == 0:
+                logger.info(
+                    "Epoch %d/%d starting: %d microsteps, worker_seed=%d, progress every %d updates",
+                    epoch,
+                    self.epochs,
+                    len(train_loader),
+                    worker_seed,
+                    self.progress_log_interval,
+                )
             train_loss = self.train_epoch(epoch, train_loader, scheduler, max_updates=max_updates)
-            logger.info("Epoch %d/%d completed. Avg Train Loss: %.4f", epoch, self.epochs, train_loss)
+            if self.rank == 0:
+                logger.info("Epoch %d/%d completed. Avg Train Loss: %.4f", epoch, self.epochs, train_loss)
 
             val_metrics: Dict[str, Any] = {}
             if val_loader is not None:
                 val_metrics = self.evaluate(val_loader, tokenizer=tokenizer)
-                logger.info(
-                    "Epoch %d Validation: Loss: %.4f | WER: %.4f | CER: %.4f",
-                    epoch,
-                    val_metrics["val_loss"],
-                    val_metrics.get("wer", 1.0),
-                    val_metrics.get("cer", 1.0),
-                )
+                if self.rank == 0:
+                    logger.info(
+                        "Epoch %d Validation: Loss: %.4f | WER: %.4f | CER: %.4f",
+                        epoch,
+                        val_metrics["val_loss"],
+                        val_metrics.get("wer", 1.0),
+                        val_metrics.get("cer", 1.0),
+                    )
 
-            current_metric = val_metrics.get("wer", train_loss)
-            is_best = current_metric < best_wer
+            current_metric = float(val_metrics.get("wer", train_loss))
+            current_cer = float(val_metrics.get("cer", float("inf")))
+            is_best = current_metric < best_wer or (
+                current_metric == best_wer and current_cer < best_cer
+            )
             if is_best:
                 best_wer = current_metric
+                best_cer = current_cer
                 best_loss = val_metrics.get("val_loss", train_loss)
                 best_epoch = epoch
+
+            local_rng = capture_rng_states()
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                rng_states_by_rank: List[Any] = [None for _ in range(self.world_size)]
+                torch.distributed.all_gather_object(rng_states_by_rank, local_rng)
+            else:
+                rng_states_by_rank = [local_rng]
 
             if is_main_process():
                 save_training_checkpoint(
@@ -332,17 +447,33 @@ class DDPASTrainer:
                     optimizer=self.optimizer,
                     scaler=self.scaler,
                     scheduler=scheduler,
-                    metrics={"train_loss": train_loss, **val_metrics},
+                    metrics={
+                        "train_loss": train_loss,
+                        **val_metrics,
+                        "best_wer": best_wer,
+                        "best_cer": best_cer,
+                        "best_loss": best_loss,
+                        "best_epoch": best_epoch,
+                    },
                     config=self.config,
                     is_best=is_best,
+                    rng_states_by_rank=rng_states_by_rank,
                 )
 
             if max_updates is not None and self.global_updates >= max_updates:
                 logger.info("Reached max_updates (%d). Stopping training.", max_updates)
                 break
 
+        if final_epoch < self.epochs:
+            logger.info(
+                "Session epoch limit reached at %d/%d. Save output and resume from checkpoint_latest.pt.",
+                final_epoch,
+                self.epochs,
+            )
+
         return {
             "best_wer": best_wer,
+            "best_cer": best_cer,
             "best_loss": best_loss,
             "best_epoch": best_epoch,
             "checkpoint_best": str(self.output_dir / "checkpoint_best.pt"),

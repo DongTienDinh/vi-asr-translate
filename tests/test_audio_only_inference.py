@@ -55,6 +55,7 @@ class TestAudioOnlyInference(unittest.TestCase):
             model = ViPViCTCASR(adapter, vocab_size=tokenizer.vocab_size, blank_id=0)
 
             pipeline = ASRInferencePipeline(model=model, tokenizer=tokenizer)
+            self.assertFalse(pipeline.frontend.training)
 
             # 1 second of random audio
             wav = torch.randn(1, 16000) * 0.05

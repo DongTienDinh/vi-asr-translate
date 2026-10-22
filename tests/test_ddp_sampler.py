@@ -38,6 +38,8 @@ class TestDistributedSamplers(unittest.TestCase):
 
         # Gate G5 assertion 1: Exact equal microstep count across ranks
         self.assertEqual(len(batches_r0), len(batches_r1))
+        self.assertEqual(len(sampler_r0), len(batches_r0))
+        self.assertEqual(len(sampler_r1), len(batches_r1))
         self.assertGreater(len(batches_r0), 0)
 
         # Gate G5 assertion 2: No collision between ranks in the same microstep
@@ -45,6 +47,24 @@ class TestDistributedSamplers(unittest.TestCase):
             set0 = set(b0)
             set1 = set(b1)
             self.assertEqual(len(set0.intersection(set1)), 0, "Ranks must not process identical samples in the same step")
+
+    def test_sampler_len_respects_frame_limited_singletons(self):
+        """DataLoader len must match iteration even when long samples force singleton batches."""
+        lengths = [100, 120, 7000, 140, 160, 7200, 180, 200, 220]
+        samplers = [
+            GlobalDurationSampler(
+                lengths=lengths,
+                world_size=2,
+                rank=rank,
+                max_samples_per_rank=2,
+                max_frames_per_rank=6400,
+                seed=42,
+            )
+            for rank in (0, 1)
+        ]
+        for sampler in samplers:
+            self.assertEqual(len(sampler), len(list(sampler)))
+        self.assertEqual(len(list(samplers[0])), len(list(samplers[1])))
 
     def test_validation_shard_sampler_exact_coverage(self):
         """Verify ValidationShardSampler partitions dataset with zero drops and zero duplicates (Gate G7)."""
